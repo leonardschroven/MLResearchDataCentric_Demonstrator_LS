@@ -289,11 +289,15 @@ def render_alignment_delta_figure(
     import matplotlib.pyplot as plt
 
     deltas = [p.err_surface_raw - baseline_raw for p in panels]
-    # Shared symmetric colour range, robust to a few extreme pixels.
+    # Shared symmetric colour range, robust to a few extreme pixels. Round the
+    # range up to a clean even-tenth top so the colourbar starts and ends on
+    # even numbers (e.g. -0.8 ... +0.8).
     allabs = np.abs(np.concatenate([d.ravel() for d in deltas]))
-    vmax = float(np.percentile(allabs, 99))
-    vmax = vmax if vmax > 0 else 1.0
-    levels = np.linspace(-vmax, vmax, 21)
+    vmax = float(np.percentile(allabs, 99)) or 1.0
+    top = float(np.ceil(vmax / 0.2) * 0.2)
+    step = 0.2 if top <= 0.4 else 0.4 if top <= 1.0 else round(top / 4, 1)
+    cticks = list(np.round(np.arange(-top, top + 1e-9, step), 2))
+    levels = np.linspace(-top, top, 21)
 
     n = len(panels)
     ncols = 3 if n % 3 == 0 else (2 if n % 2 == 0 else n)
@@ -304,13 +308,14 @@ def render_alignment_delta_figure(
     )
     mesh = None
     for ax, p, d in zip(axes.ravel(), panels, deltas):
-        mesh = ax.contourf(p.xx, p.yy, d, levels=levels, cmap="RdBu_r",
-                           vmin=-vmax, vmax=vmax, extend="both")
+        # Same viridis colour scheme as the alignment figure.
+        mesh = ax.contourf(p.xx, p.yy, d, levels=levels, cmap="viridis",
+                           vmin=-top, vmax=top, extend="both")
         ax.add_patch(plt.Circle(
             p.center, p.radius, fill=False, linewidth=1.8,
-            edgecolor="black", linestyle="--",
+            edgecolor="white", linestyle="--",
         ))
-        ax.plot(*p.center, marker="+", color="black", markersize=9, markeredgewidth=1.6)
+        ax.plot(*p.center, marker="+", color="white", markersize=9, markeredgewidth=1.6)
         ax.set_title(f"centre = ({p.center[0]:.2f}, {p.center[1]:.2f})", fontsize=13)
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
@@ -322,9 +327,7 @@ def render_alignment_delta_figure(
         ax.axis("off")
 
     if mesh is not None:
-        # Clean symmetric ticks centred on zero, rounded to two decimals.
-        step = round(vmax / 2, 2) or round(vmax / 2, 3)
-        cticks = [-2 * step, -step, 0.0, step, 2 * step]
+        # Colourbar on the right with even start/end ticks (see cticks above).
         cbar = fig.colorbar(mesh, ax=axes, location="right", shrink=0.85,
                             pad=0.02, ticks=cticks)
         cbar.set_label("error change vs. no-weakspot baseline", fontsize=13)
