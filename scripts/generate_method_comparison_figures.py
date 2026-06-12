@@ -128,6 +128,61 @@ def _barh(stats: pd.DataFrame, value: str, *, ascending_is_better: bool,
     print(f"  wrote {path}")
 
 
+# Parameter axes for the paper's sensitivity figures (Figs 7-9 in main.tex).
+# (swept column, x-axis label, output filename)
+SENSITIVITY_AXES = [
+    ("noise_std", "noise sigma on the underlying function",
+     "04_sensitivity_noise.png"),
+    ("n_bumps", "function complexity (number of Gaussian bumps)",
+     "05_sensitivity_complexity.png"),
+    ("radius", "exclusion radius r", "06_sensitivity_radius.png"),
+]
+
+
+def _sensitivity_line(df: pd.DataFrame, dim: str, xlabel: str,
+                      filename: str) -> None:
+    """Mean IoU@q=0.90 against one swept parameter, one line per method.
+
+    Rendered with matplotlib because the Plotly/Kaleido image-export path is
+    unavailable in this environment. Large fonts for print legibility; the
+    legend is sorted so the strongest methods come first.
+    """
+    import matplotlib.cm as cm
+
+    if dim not in df.columns:
+        print(f"  skip {filename}: column {dim} missing from CSV.")
+        return
+    methods = BASE_METHODS + SIMPLE_ENSEMBLES + ADVANCED_ENSEMBLES
+    sub = df[df["method"].isin(methods)]
+    order = (sub.groupby("method")[PRIMARY].mean()
+             .sort_values(ascending=False).index.tolist())
+    grp = sub.groupby(["method", dim])[PRIMARY].mean().reset_index()
+
+    colors = cm.get_cmap("tab20")(range(len(order)))
+    markers = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">", "h", "p"]
+
+    fig, ax = plt.subplots(figsize=(8.6, 6.6), constrained_layout=True)
+    for i, m in enumerate(order):
+        d = grp[grp["method"] == m].sort_values(dim)
+        ax.plot(d[dim], d[PRIMARY], color=colors[i],
+                marker=markers[i % len(markers)], markersize=8,
+                linewidth=2.2, alpha=0.9, label=m)
+    ax.set_xlabel(xlabel, fontsize=FS_LABEL)
+    ax.set_ylabel("mean IoU @ q=0.90", fontsize=FS_LABEL)
+    ax.set_title(f"Mean IoU vs {xlabel} (higher is better)", fontsize=FS_TITLE)
+    ax.tick_params(axis="both", labelsize=FS_TICK)
+    ax.grid(color="lightgray", linewidth=0.7)
+    ax.set_axisbelow(True)
+    ax.legend(fontsize=FS_LEGEND, ncol=2, frameon=False,
+              loc="upper center", bbox_to_anchor=(0.5, -0.13))
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = OUT_DIR / filename
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {path}")
+
+
 def main() -> int:
     df = _load()
     print(f"Loaded {len(df):,} rows, {df['method'].nunique()} methods.")
@@ -155,6 +210,10 @@ def main() -> int:
           xlabel="mean IoU @ q=0.90 (higher is better)",
           title="All methods: region overlap",
           filename="advanced_iou.png", height=6.6, show_legend=True)
+
+    # --- Sensitivity line charts (Figs 7-9): mean IoU vs each swept parameter ---
+    for dim, xlabel, filename in SENSITIVITY_AXES:
+        _sensitivity_line(df, dim, xlabel, filename)
     print("Done.")
     return 0
 
