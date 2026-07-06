@@ -47,6 +47,15 @@ Override any of them with --<field> <value> (e.g. --seed 7 --complexity 0.3).
 """
 from __future__ import annotations
 
+import os
+import warnings
+
+# Quiet the expected sklearn ConvergenceWarnings (MLP hits max_iter by design —
+# training time is a swept parameter) so they don't bury the progress bar. Setting
+# PYTHONWARNINGS before joblib spawns workers propagates the filter to them too.
+os.environ.setdefault("PYTHONWARNINGS", "ignore")
+warnings.filterwarnings("ignore")
+
 import argparse
 import datetime as _dt
 import time
@@ -122,46 +131,71 @@ def main() -> None:
     t0 = time.time()
     n = len(remaining)
 
-    def tick(done: int) -> None:
-        el = time.time() - t0
-        eta = (el / max(done, 1)) * (n - done) / 60
-        print(f"  {done:,}/{n:,}  elapsed {el/60:5.1f} min  ETA {eta:6.1f} min", flush=True)
+    # Live progress bar (tqdm). Falls back to periodic prints if tqdm is absent so
+    # the runner never hard-depends on it. tqdm draws a single updating line with a
+    # percentage, count, rate and ETA, and works both on a terminal and when the
+    # output is redirected to a log file.
+    try:
+        from tqdm import tqdm
+        bar = tqdm(total=n, unit="cfg", dynamic_ncols=True, smoothing=0.05, desc="sweep")
+    except ImportError:
+        bar = None
+        print("(tqdm not installed — periodic text progress instead; "
+              "`pip install tqdm` for a live bar)", flush=True)
+
+    def advance(k: int, done: int, force: bool = False) -> None:
+        if bar is not None:
+            bar.update(k)
+            return
+        if force or done % 10 == 0 or done == n:
+            el = time.time() - t0
+            eta = (el / max(done, 1)) * (n - done) / 60
+            print(f"  {done:,}/{n:,}  elapsed {el/60:5.1f} min  ETA {eta:6.1f} min",
+                  flush=True)
+
+    def note(msg: str) -> None:
+        bar.write(msg) if bar is not None else print(f"  {msg}", flush=True)
 
     if args.workers > 1:
         from joblib import Parallel, delayed, parallel_backend
-        i, w, done = 0, args.workers, 0
-        while i < n:
-            batch = max(w * 4, 1)
+        w, done = args.workers, 0
+        while done < n:
             try:
                 with parallel_backend("loky", inner_max_num_threads=1):
-                    with Parallel(n_jobs=w) as par:
-                        while i < n:
-                            chunk = remaining[i:i + batch]
-                            for rows in par(delayed(SW.safe_run_one)(p) for p in chunk):
-                                if rows:
-                                    SW.append_rows(out, rows)
-                            i += len(chunk); done += len(chunk); tick(done)
+                    # Stream results as each config finishes (ordered), so we append
+                    # its rows and tick the bar per config — not per batch. Ordered
+                    # streaming means only yielded configs are appended, so a mid-run
+                    # worker crash never double-writes: we simply resume at `done`.
+                    gen = Parallel(n_jobs=w, return_as="generator")(
+                        delayed(SW.safe_run_one)(p) for p in remaining[done:])
+                    for rows in gen:
+                        if rows:
+                            SW.append_rows(out, rows)
+                        done += 1
+                        advance(1, done)
                 break
             except Exception as e:
-                w = max(1, w // 2)
-                print(f"  workers terminated ({type(e).__name__}); reducing to {w} "
-                      f"and continuing", flush=True)
-                if w == 1:
-                    for p in remaining[i:]:
+                if w == 1:                       # already minimal — fall back in-process
+                    note(f"parallel failed at 1 worker ({type(e).__name__}); running sequentially")
+                    for p in remaining[done:]:
                         rows = SW.safe_run_one(p)
                         if rows:
                             SW.append_rows(out, rows)
-                        i += 1; done += 1; tick(done)
+                        done += 1; advance(1, done)
                     break
+                w = max(1, w // 2)
+                note(f"workers terminated ({type(e).__name__}, usually OOM); "
+                     f"reducing to {w} and continuing")
     else:
         for i, p in enumerate(remaining, 1):
             try:
                 SW.append_rows(out, SW.run_one(p))
             except Exception as e:
-                print(f"  config {i} failed: {e}", flush=True)
-            if i % 10 == 0 or i == n:
-                tick(i)
+                note(f"config {i} failed: {e}")
+            advance(1, i)
 
+    if bar is not None:
+        bar.close()
     print(f"DONE in {(time.time()-t0)/60:.1f} min. Rows appended to {out}")
 
 
