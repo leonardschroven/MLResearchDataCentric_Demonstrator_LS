@@ -39,7 +39,7 @@ def plot_data_overview(X_norm, y, X_excl_norm, center, radius,
         ))
 
     # Draw boundary: circle for radius mode, convex hull for kNN mode
-    if excl_mode == "Circle (radius)":
+    if excl_mode == "Circle (radius)" and radius and radius > 0:
         fig.add_trace(_circle_trace(center, radius))
     elif len(X_excl_norm) >= 3:
         from scipy.spatial import ConvexHull
@@ -124,7 +124,8 @@ def plot_ground_truth_error(X_test_norm, errors, center, radius):
         text=[f"err: {e:.3f}" for e in errors],
     ))
 
-    fig.add_trace(_circle_trace(center, radius))
+    if radius and radius > 0:
+        fig.add_trace(_circle_trace(center, radius))
 
     fig.update_layout(
         title="Ground-Truth Error Surface (Actual Test Points — No Interpolation)",
@@ -171,17 +172,18 @@ def plot_ground_truth_error_3d(X_test_norm, errors, center, radius, sigma=0.0):
         name="Error surface",
     ))
 
-    # Draw weakspot circle on the base plane
-    theta = np.linspace(0, 2 * np.pi, 200)
-    cx, cy = center
-    x_c = cx + radius * np.cos(theta)
-    y_c = cy + radius * np.sin(theta)
-    fig.add_trace(go.Scatter3d(
-        x=x_c, y=y_c, z=np.zeros(200),
-        mode="lines",
-        line=dict(color="red", width=4),
-        name="Induced weakspot zone",
-    ))
+    # Draw weakspot circle on the base plane (skip when no weakspot induced)
+    if radius and radius > 0:
+        theta = np.linspace(0, 2 * np.pi, 200)
+        cx, cy = center
+        x_c = cx + radius * np.cos(theta)
+        y_c = cy + radius * np.sin(theta)
+        fig.add_trace(go.Scatter3d(
+            x=x_c, y=y_c, z=np.zeros(200),
+            mode="lines",
+            line=dict(color="red", width=4),
+            name="Induced weakspot zone",
+        ))
 
     smooth_label = f"  (σ={sigma:.2f})" if sigma > 0 else "  (no smoothing)"
     fig.update_layout(
@@ -199,8 +201,12 @@ def plot_ground_truth_error_3d(X_test_norm, errors, center, radius, sigma=0.0):
 
 
 def plot_all_methods(xx, yy, surfaces: dict, center, radius,
-                     X_test_norm, errors):
-    """Grid of subplots — one per detection method."""
+                     X_test_norm, errors, extractions: dict | None = None):
+    """Grid of subplots — one per detection method.
+
+    If ``extractions`` is provided, the extracted 2σ ellipse and centroid are
+    overlaid on each subplot.
+    """
     methods = list(surfaces.keys())
     n = len(methods)
     cols = 4
@@ -235,6 +241,22 @@ def plot_all_methods(xx, yy, surfaces: dict, center, radius,
             showlegend=(i == 0), name="Induced zone"
         ), row=r, col=c)
 
+        ext = extractions.get(name) if extractions else None
+        if ext is not None:
+            fig.add_trace(go.Scatter(
+                x=ext["ellipse_x"], y=ext["ellipse_y"],
+                mode="lines",
+                line=dict(color="cyan", width=2),
+                showlegend=(i == 0), name="Detected 2σ ellipse",
+            ), row=r, col=c)
+            fig.add_trace(go.Scatter(
+                x=[ext["center"][0]], y=[ext["center"][1]],
+                mode="markers",
+                marker=dict(color="cyan", size=8, symbol="x",
+                            line=dict(width=1.5, color="black")),
+                showlegend=(i == 0), name="Detected centroid",
+            ), row=r, col=c)
+
     fig.update_layout(
         title="Weakspot Detection — All Methods",
         height=max(350, rows * 320),
@@ -244,7 +266,8 @@ def plot_all_methods(xx, yy, surfaces: dict, center, radius,
 
 
 def plot_comparison(xx, yy, gt_surface, best_surface, best_name,
-                    center, radius, X_test_norm, errors, sigma=0.0):
+                    center, radius, X_test_norm, errors, sigma=0.0,
+                    extraction=None):
     """Side-by-side: ground truth errors (Delaunay polygon surface) vs detected weakspot."""
     from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
     fig = make_subplots(rows=1, cols=2,
@@ -287,11 +310,12 @@ def plot_comparison(xx, yy, gt_surface, best_surface, best_name,
         opacity=0.7,
     ), row=1, col=1)
 
-    fig.add_trace(go.Scatter(
-        x=x_c, y=y_c, mode="lines",
-        line=dict(color="red", width=2, dash="dash"),
-        name="Induced zone", showlegend=True,
-    ), row=1, col=1)
+    if radius and radius > 0:
+        fig.add_trace(go.Scatter(
+            x=x_c, y=y_c, mode="lines",
+            line=dict(color="red", width=2, dash="dash"),
+            name="Induced zone", showlegend=True,
+        ), row=1, col=1)
 
     # ── Right: detected surface as contour ──
     Z = best_surface.reshape(xx.shape)
@@ -306,11 +330,12 @@ def plot_comparison(xx, yy, gt_surface, best_surface, best_name,
         contours=dict(showlines=False), opacity=0.9,
     ), row=1, col=2)
 
-    fig.add_trace(go.Scatter(
-        x=x_c, y=y_c, mode="lines",
-        line=dict(color="red", width=2, dash="dash"),
-        name="Induced zone", showlegend=False,
-    ), row=1, col=2)
+    if radius and radius > 0:
+        fig.add_trace(go.Scatter(
+            x=x_c, y=y_c, mode="lines",
+            line=dict(color="red", width=2, dash="dash"),
+            name="Induced zone", showlegend=False,
+        ), row=1, col=2)
 
     fig.add_trace(go.Scatter(
         x=X_test_norm[:, 0], y=X_test_norm[:, 1],
@@ -318,6 +343,21 @@ def plot_comparison(xx, yy, gt_surface, best_surface, best_name,
         marker=dict(color="#00BFFF", size=4, line=dict(width=0.6, color="black")),
         name="Test points", showlegend=False, opacity=0.7,
     ), row=1, col=2)
+
+    if extraction is not None:
+        fig.add_trace(go.Scatter(
+            x=extraction["ellipse_x"], y=extraction["ellipse_y"],
+            mode="lines",
+            line=dict(color="cyan", width=2.5),
+            name="Detected 2σ ellipse", showlegend=True,
+        ), row=1, col=2)
+        fig.add_trace(go.Scatter(
+            x=[extraction["center"][0]], y=[extraction["center"][1]],
+            mode="markers",
+            marker=dict(color="cyan", size=10, symbol="x",
+                        line=dict(width=1.5, color="black")),
+            name="Detected centroid", showlegend=True,
+        ), row=1, col=2)
 
     fig.update_layout(
         height=460, template="plotly_white",
