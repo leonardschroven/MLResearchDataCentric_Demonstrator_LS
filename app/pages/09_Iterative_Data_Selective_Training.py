@@ -179,8 +179,11 @@ if run_btn:
     Xr, yr = X_tr0.copy(), y_tr0.copy()
     mg = m0
 
-    # Four tracks: strategy (guided/random) × regime (accumulative/new-only).
-    TRACKS = ("gacc", "racc", "gnew", "rnew")
+    # Six tracks: strategy (guided/random) × regime
+    # (accumulative / new-only / scaled-accum). Scaled-accum keeps the accumulative
+    # DISTRIBUTION but subsamples it down to the new-only point BUDGET, so it is a
+    # fair, size-matched control (a fixed-size replay buffer).
+    TRACKS = ("gacc", "racc", "gnew", "rnew", "gsca", "rsca")
     hist = {k: [met0["MAE"]] for k in TRACKS}
     ein = {k: [_region(err0)] for k in TRACKS}
     rounds = []
@@ -220,11 +223,23 @@ if run_btn:
         # new-only: retrain from scratch on just this round's selection
         _,  mae_gnew, ein_gnew = _fit_eval(Xsel_g, ysel_g)
         _,  mae_rnew, ein_rnew = _fit_eval(Xsel_r, ysel_r)
+        # scaled-accum: same point BUDGET as new-only (a random subsample of the
+        # full accumulated pool), so it retains coverage but matches the size —
+        # isolating distribution from raw count. Falls back to the whole pool if it
+        # is already smaller than the budget.
+        bud_g = min(len(Xsel_g), len(Xg))
+        sub_g = rng.choice(len(Xg), size=bud_g, replace=False)
+        _,  mae_gsca, ein_gsca = _fit_eval(Xg[sub_g], yg[sub_g])
+        bud_r = min(len(Xsel_r), len(Xr))
+        sub_r = rng.choice(len(Xr), size=bud_r, replace=False)
+        _,  mae_rsca, ein_rsca = _fit_eval(Xr[sub_r], yr[sub_r])
 
         hist["gacc"].append(mae_gacc); hist["racc"].append(mae_racc)
         hist["gnew"].append(mae_gnew); hist["rnew"].append(mae_rnew)
+        hist["gsca"].append(mae_gsca); hist["rsca"].append(mae_rsca)
         ein["gacc"].append(ein_gacc); ein["racc"].append(ein_racc)
         ein["gnew"].append(ein_gnew); ein["rnew"].append(ein_rnew)
+        ein["gsca"].append(ein_gsca); ein["rsca"].append(ein_rsca)
 
         rounds.append(dict(
             c_g=c_g, Xc_g=Xc_g, w_g=w_g, Xsel_g=Xsel_g, errg=errg, ext_g=ext_g,
@@ -261,6 +276,8 @@ _TRACKS = {
     "racc": ("random", "accumulative", "#d62728"),
     "gnew": ("guided", "new-only", "#2ca02c"),
     "rnew": ("random", "new-only", "#d62728"),
+    "gsca": ("guided", "scaled-accum", "#2ca02c"),
+    "rsca": ("random", "scaled-accum", "#d62728"),
 }
 _CMAP = {"guided": "#2ca02c", "random": "#d62728"}
 
@@ -279,16 +296,20 @@ with tab_v:
     # 1) Performance per iteration
     st.subheader("① Training progress — MAE per iteration")
     st.caption(
-        "Four tracks: **strategy** (guided = green, random = red) × **regime** "
-        "(accumulative = solid, new-only = dashed). Accumulative retrains on the "
-        "growing set; new-only retrains from scratch on just that round's "
-        "selection. Iteration 0 is the shared initial model. Lower is better."
+        "Six tracks: **strategy** (guided = green, random = red) × **regime** "
+        "(line style). **Accumulative** retrains on the whole growing set; "
+        "**new-only** retrains from scratch on just that round's selection; "
+        "**scaled-accum** subsamples the accumulated pool down to the *same point "
+        "count as new-only* — a size-matched control (a fixed replay buffer). If "
+        "scaled-accum tracks accumulative and beats new-only despite equal point "
+        "counts, the advantage is the training **distribution**, not the raw amount "
+        "of data. Iteration 0 is the shared initial model. Lower is better."
     )
     dfc = _long(R["hist"])
     figp = px.line(dfc, x="iteration", y="value", color="strategy", line_dash="regime",
                    markers=True, color_discrete_map=_CMAP,
                    labels={"value": "MAE"},
-                   title="Evaluation MAE vs iteration — accumulative vs new-only")
+                   title="Evaluation MAE vs iteration — accumulative vs new-only vs scaled-accum")
     figp.update_layout(height=440, legend_title_text="")
     st.plotly_chart(figp, width='stretch')
 
@@ -347,6 +368,8 @@ with tab_s:
         "iteration": iters,
         "guided_acc_MAE": np.round(H["gacc"], 4),
         "random_acc_MAE": np.round(H["racc"], 4),
+        "guided_scaled_MAE": np.round(H["gsca"], 4),
+        "random_scaled_MAE": np.round(H["rsca"], 4),
         "guided_new_MAE": np.round(H["gnew"], 4),
         "random_new_MAE": np.round(H["rnew"], 4),
     })
@@ -358,14 +381,22 @@ with tab_s:
 
     gacc, racc = H["gacc"][-1], H["racc"][-1]
     gnew, rnew = H["gnew"][-1], H["rnew"][-1]
+    gsca, rsca = H["gsca"][-1], H["rsca"][-1]
     v_acc = "**below** random ✅" if gacc < racc else "**above** random ⚠️"
+    fair = ("**confirms distribution matters** ✅" if gsca < gnew else
+            "does not separate from new-only here ⚠️")
     st.markdown(
         f"After **{R['n_iterations']}** iterations:\n\n"
         f"- **Accumulative** — guided **{gacc:.4f}** vs random **{racc:.4f}** "
         f"(guided finished {v_acc}, Δ {gacc - racc:+.4f}).\n"
         f"- **New-only** — guided **{gnew:.4f}** vs random **{rnew:.4f}**. "
         f"Retraining on only each round's points typically stays far worse than the "
-        f"accumulative regime — the iterative sign of catastrophic forgetting."
+        f"accumulative regime — the iterative sign of catastrophic forgetting.\n"
+        f"- **Scaled-accum (size-matched control)** — guided **{gsca:.4f}** vs random "
+        f"**{rsca:.4f}**. Same point count as new-only, but sampled to keep coverage: "
+        f"guided scaled-accum vs guided new-only = {gsca - gnew:+.4f} → this {fair} "
+        f"(if scaled-accum beats new-only at equal size, the win is the training "
+        f"distribution, not the number of points)."
     )
     st.download_button("⬇ Download iteration history (CSV)",
                        data=df.to_csv(index=False).encode("utf-8"),
