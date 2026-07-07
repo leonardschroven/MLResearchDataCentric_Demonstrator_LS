@@ -18,11 +18,19 @@ AVAILABLE_MODELS = {
 
 
 def build_model(key: str, complexity: float = 0.5, iterations: int = 100,
-                random_state: int = 42):
+                random_state: int = 42, warm_start: bool = False,
+                early_stopping: bool | None = None):
     """
     Build a regression model.
     complexity: [0,1] – controls model capacity
     iterations: number of estimators / epochs
+    warm_start: if True, the MLP keeps its weights across successive ``fit`` calls
+        so training can be *continued* (transfer / fine-tuning) instead of restarted.
+        Only affects the MLP; other estimators ignore it.
+    early_stopping: MLP only. ``None`` (default) keeps the legacy behaviour — early
+        stopping on unless ``warm_start`` is set. Pass an explicit ``True``/``False``
+        to control it directly (a regulariser: stops once a held-out validation split
+        stops improving, at the cost of not fitting on that split).
     """
     if key == "ridge":
         alpha = 10 ** (2 - 4 * complexity)  # [0.01, 100]
@@ -50,11 +58,13 @@ def build_model(key: str, complexity: float = 0.5, iterations: int = 100,
 
     elif key == "mlp":
         h = max(8, int(complexity * 128))  # [8, 128]
+        es = (not warm_start) if early_stopping is None else bool(early_stopping)
         return Pipeline([
             ("scaler", StandardScaler()),
             ("model", MLPRegressor(
                 hidden_layer_sizes=(h, h), max_iter=iterations,
-                random_state=random_state, early_stopping=True
+                random_state=random_state,
+                early_stopping=es, warm_start=warm_start
             ))
         ])
 

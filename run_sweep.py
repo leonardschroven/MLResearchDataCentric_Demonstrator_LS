@@ -13,14 +13,14 @@ Quick start (Linux / EC2)
     python3 -m venv .venv && source .venv/bin/activate
     pip install -r requirements.txt
 
-    # resume/append the default results file (default sidebar settings):
-    python run_sweep.py --workers $(nproc)
+    # dry-run first — prints the target file, grid size and ETA, then exits:
+    python run_sweep.py --config alpha_boundary --dry-run
 
-    # OR start a clean, self-consistent run in a NEW file (keeps the old one):
-    python run_sweep.py --fresh --workers $(nproc)
+    # run it (default config is alpha_boundary; --workers $(nproc) uses all cores):
+    python run_sweep.py --config alpha_boundary --workers $(nproc)
 
-    # keep it running after you log out:
-    nohup python run_sweep.py --fresh --workers $(nproc) > sweep.log 2>&1 &
+    # keep it running after you log out (recommended on EC2):
+    nohup python run_sweep.py --config alpha_boundary --workers $(nproc) > sweep.log 2>&1 &
     tail -f sweep.log
 
 --------------------------------------------------------------------------------
@@ -31,8 +31,11 @@ Windows (PowerShell, from the Application folder)
 --------------------------------------------------------------------------------
 Output selection
 --------------------------------------------------------------------------------
-* default        -> append/resume  data/experiment_results/data_selective_training_sweep.csv
-* --fresh        -> a NEW timestamped file  ...sweep_fresh_YYYYmmdd_HHMMSS.csv
+* --config NAME  -> pick the sweep config (grid + detectors) from
+                    scripts/dataselect/sweep_configs/NAME.json  (default: alpha_boundary)
+* default        -> append/resume the active config's file
+                    data/experiment_results/sweep__<config>.csv
+* --fresh        -> a NEW timestamped file  sweep__<config>_fresh_YYYYmmdd_HHMMSS.csv
                     (the existing results file is left completely untouched, so a
                      fresh run is consistent: one code version, one file, full grid)
 * --output PATH  -> write/resume an explicit path (overrides --fresh)
@@ -64,13 +67,13 @@ from pathlib import Path
 from scripts.dataselect import sweep as SW
 
 # Held-fixed fields — mirror the Data-Selective Training page sidebar defaults.
+# (``seed`` is NOT here: it is a swept axis in the config grid now.)
 FIXED_DEFAULTS = dict(
     model_name="MLP Neural Network", complexity=0.5,
     center_x=0.5, center_y=0.5,
     n_eval=1000, grid_res=35, extract_q=0.85,
     sel_mode="Sample ∝ weight",
     shift_center_x=0.30, shift_center_y=0.30, shift_spread=0.15,
-    seed=42,
 )
 
 
@@ -97,19 +100,31 @@ def main() -> None:
                          "single-code-version experiment).")
     ap.add_argument("--output", type=str, default=None,
                     help="Explicit CSV path to write/resume. Overrides --fresh.")
-    # allow overriding any fixed field, e.g. --seed 7 --complexity 0.3
+    ap.add_argument("--config", type=str, default=None,
+                    help="Sweep config name from scripts/dataselect/sweep_configs/ "
+                         "(e.g. alpha_boundary, isolate_alpha_x_radius). "
+                         "Default: the module's active config (alpha_boundary).")
+    ap.add_argument("--no-early-stopping", dest="early_stopping", action="store_false",
+                    help="Disable MLP early stopping for the whole sweep (default: on).")
+    ap.set_defaults(early_stopping=True)
+    # allow overriding any fixed field, e.g. --complexity 0.3
     for k, v in FIXED_DEFAULTS.items():
         ap.add_argument(f"--{k}", type=type(v), default=v)
     args = ap.parse_args()
 
+    if args.config:                       # switch grid + detectors + output path
+        SW.set_active_config(args.config)
+
     out = resolve_output(args)
     fixed = {k: getattr(args, k) for k in FIXED_DEFAULTS}
+    fixed["early_stopping"] = bool(args.early_stopping)
     total = len(SW.parameter_grid())
     remaining = SW.remaining_combos(fixed, out)
     done_here = total - len(remaining)
     eta_min = len(remaining) * SW.SECS_PER_RUN / 60
     existed = out.exists()
 
+    print(f"Config:     {SW.SWEEP_CONFIG_NAME}  (early_stopping={fixed['early_stopping']})")
     print(f"Target CSV: {out}"
           + ("  (resuming existing file)" if existed else "  (new file)"))
     if out != SW.CSV_PATH:

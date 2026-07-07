@@ -1,0 +1,28 @@
+{
+  "name": "isolate_alpha_x_radius",
+  "description": "Focused sub-study. Everything fixed at the design centre; sweeps only rehearsal-mix alpha x gap-size (radius) x sel_sigma x seed to map whether rehearsal moves the win/lose boundary that sigma alone cannot. ~168 configs (minutes).",
+  "secs_per_run": 2.1,
+  "detectors": [
+    "EVT × GPR (geometric)",
+    "kNN Performance Mapping",
+    "Peaks over Threshold (EVT)",
+    "GPR/kNN (variance-weighted)",
+    "RBF Interpolation"
+  ],
+  "grid": {
+    "n_bumps":        [5],
+    "noise_std":      [0.05],
+    "n_pool_total":   [2000],
+    "shift_strength": [0.0],
+    "radius":         [0.0, 0.06, 0.08, 0.1, 0.12, 0.15, 0.2],
+    "iters_initial":  [100],
+    "n_train":        [800],
+    "sel_sigma":      [0.1, 0.3],
+    "n_select":       [300],
+    "n_candidate":    [2000],
+    "sel_method":     ["Weakpoint distance"],
+    "mix_ratio":      [1.0, 0.75, 0.5, 0.25],
+    "iters_retrain":  [200],
+    "seed":           [42, 0, 7]
+  }
+}

@@ -16,6 +16,7 @@ The parameter *sweep* over these settings is a separate, later step.
 """
 from __future__ import annotations
 
+import copy
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -131,8 +132,32 @@ sel_sigma = st.sidebar.slider("Selection Gaussian σ (variance)", 0.02, 0.80, 0.
 n_select = st.sidebar.slider("Points to add", 20, 1000, 500, 20)
 n_candidate = st.sidebar.slider("Candidate pool size", 200, 4000, 1500, 100,
                                 help="Fresh labelled points available to select from.")
+mix_ratio = st.sidebar.slider(
+    "Guided fraction α (rehearsal mix)", 0.0, 1.0, 1.0, 0.1,
+    help="Fraction of the added points chosen by the weakspot kernel; the rest "
+         "(1−α) are drawn **uniformly** (rehearsal / coverage). α=1.0 = pure guided "
+         "(default), α=0.0 = pure uniform (= the random baseline). Lower α trades "
+         "gap focus for global coverage to combat forgetting.")
 
 st.sidebar.subheader("8. Retraining")
+training_mode = st.sidebar.radio(
+    "Training mode", ["From scratch (retrain)", "Warm-start (transfer)"], index=0,
+    help="How the model learns from the newly selected points (in both cases it "
+         "trains on the **new points only** — the original set is not reused).\n\n"
+         "• **From scratch** — a brand-new model is trained on the new points (the "
+         "original default; this is what the parameter sweep on the next page uses).\n"
+         "• **Warm-start (transfer)** — the initial model's weights are kept and "
+         "*fine-tuned* on the new points (a retrain, not a fresh train). MLP only; "
+         "other algorithms fall back to from scratch. The guided model **and** the "
+         "random baseline both warm-start from the *same* initial model, so the "
+         "head-to-head stays fair.")
+early_stop = st.sidebar.checkbox(
+    "Early stopping (regularise MLP)", value=True,
+    help="MLP only. When on (default), training stops once a held-out validation "
+         "split (~10%% of the training data) stops improving — sklearn's "
+         "early_stopping, a regulariser against overfitting. Turn off to train the "
+         "full epoch budget. Applies to the initial model and every retrain "
+         "(guided + baseline).")
 iters_retrain = st.sidebar.slider("Retraining time (iterations)", 20, 800, 150, 10)
 
 st.sidebar.markdown("---")
@@ -176,6 +201,27 @@ if run_btn or st.session_state.pop("_trigger_run", False):
     rng = np.random.RandomState(int(seed))
     center = np.array([center_x, center_y])
 
+    # Warm-start (transfer) is implemented for the MLP; other algorithms fall back
+    # to from-scratch. Both the guided model and the random baseline warm-start from
+    # the same initial model, so the comparison stays fair.
+    warm = training_mode.startswith("Warm") and AVAILABLE_MODELS[model_name] == "mlp"
+    if training_mode.startswith("Warm") and not warm:
+        st.info(f"Warm-start is only implemented for the MLP; **{model_name}** "
+                f"retrains from scratch instead.")
+
+    def _retrain(base, X, y):
+        """Retrain on (X, y). Warm-start continues from ``base``'s weights (transfer,
+        new points only); from-scratch builds and trains a brand-new model."""
+        if warm:
+            m = copy.deepcopy(base)
+            m.named_steps["model"].max_iter = int(iters_retrain)
+        else:
+            m = build_model(AVAILABLE_MODELS[model_name],
+                            complexity=complexity, iterations=int(iters_retrain),
+                            early_stopping=early_stop)
+        m.fit(X, y)
+        return m
+
     # ---- 1. SETUP -------------------------------------------------------
     with st.spinner("Setup — sampling landscape & inducing the weakspot…"):
         X_all = P.sample_inputs(n_pool_total, rng, shift_strength=shift_strength,
@@ -206,7 +252,8 @@ if run_btn or st.session_state.pop("_trigger_run", False):
     # ---- 2. TRAINING (initial) -----------------------------------------
     with st.spinner(f"Training {model_name} ({iters_initial} iters)…"):
         model0 = build_model(AVAILABLE_MODELS[model_name],
-                             complexity=complexity, iterations=int(iters_initial))
+                             complexity=complexity, iterations=int(iters_initial),
+                             warm_start=warm, early_stopping=early_stop)
         model0.fit(X_tr0, y_tr0)
 
     # ---- 3. EVALUATION (initial) ---------------------------------------
@@ -226,7 +273,7 @@ if run_btn or st.session_state.pop("_trigger_run", False):
         y_cand = P.label(X_cand, rng, n_bumps=n_bumps, noise_std=noise_std)
         sel_idx, sel_w = P.select_by_weakspot(
             X_cand, sel_center, sel_sigma, int(n_select), rng, mode=sel_mode,
-            method=sel_method, ext=ext0, surf=surf0)
+            method=sel_method, ext=ext0, surf=surf0, mix_ratio=float(mix_ratio))
         X_sel, y_sel = X_cand[sel_idx], y_cand[sel_idx]
 
     # ---- 6. RETRAINING (on the newly selected points ONLY) --------------
@@ -235,9 +282,7 @@ if run_btn or st.session_state.pop("_trigger_run", False):
             X_tr1, y_tr1 = X_sel, y_sel
         else:                       # no points selected → fall back to original
             X_tr1, y_tr1 = X_tr0, y_tr0
-        model1 = build_model(AVAILABLE_MODELS[model_name],
-                             complexity=complexity, iterations=int(iters_retrain))
-        model1.fit(X_tr1, y_tr1)
+        model1 = _retrain(model0, X_tr1, y_tr1)
 
     # ---- 7. RE-EVALUATION ----------------------------------------------
     _, err1, metrics1 = P.evaluate(model1, X_eval, y_eval)
@@ -257,9 +302,7 @@ if run_btn or st.session_state.pop("_trigger_run", False):
             X_trR, y_trR = X_rand, y_rand
         else:
             X_trR, y_trR = X_tr0, y_tr0
-        modelR = build_model(AVAILABLE_MODELS[model_name],
-                             complexity=complexity, iterations=int(iters_retrain))
-        modelR.fit(X_trR, y_trR)
+        modelR = _retrain(model0, X_trR, y_trR)
     _, errR, metricsR = P.evaluate(modelR, X_eval, y_eval)
     einR, eoutR = (P.region_error(X_eval, errR, center, r_eff)
                    if r_eff > 0 else (float("nan"), float("nan")))
@@ -280,7 +323,8 @@ if run_btn or st.session_state.pop("_trigger_run", False):
         model_name=model_name, detect_name=detect_name,
         iters_initial=iters_initial, iters_retrain=iters_retrain,
         n_select=len(X_sel), sel_sigma=sel_sigma, sel_mode=sel_mode,
-        sel_method=sel_method,
+        sel_method=sel_method, mix_ratio=float(mix_ratio),
+        training_mode=("Warm-start (transfer)" if warm else "From scratch (retrain)"),
         # random baseline
         X_rand=X_rand, y_rand=y_rand, X_trR=X_trR, errR=errR, metricsR=metricsR,
         einR=einR, eoutR=eoutR, surfR=surfR, extR=extR, distR=distR, iouR=iouR,
@@ -302,13 +346,35 @@ import time
 from scripts.dataselect import sweep as SW
 
 st.header("🧪 Run Options")
+_cfg_names = SW.available_configs()
+_cfg_choice = st.selectbox(
+    "Sweep configuration", _cfg_names,
+    index=_cfg_names.index(SW.SWEEP_CONFIG_NAME) if SW.SWEEP_CONFIG_NAME in _cfg_names else 0,
+    help="The parameter grid + detectors, loaded from `scripts/dataselect/"
+         "sweep_configs/<name>.json`. Each config writes to its own results file "
+         "`sweep__<name>.csv`, and every row is stamped with the config name. Add a "
+         "JSON there to create a new sweep (e.g. one that isolates a few dimensions).")
+if _cfg_choice != SW.SWEEP_CONFIG_NAME:
+    SW.set_active_config(_cfg_choice)
+st.caption(
+    f"**{SW.SWEEP_CONFIG_NAME}** → `{SW.CSV_PATH}`  ·  "
+    f"{SW.ACTIVE_CONFIG.get('description', '')}")
+sweep_early_stop = st.checkbox(
+    "Early stopping in the sweep (MLP regulariser)", value=True,
+    help="Applies to every model trained during the **parameter sweep** (initial, "
+         "guided retrain, random baseline). **On (default)** matches the validated "
+         "behaviour and regularises the small-sample retrains; off trains the full "
+         "epoch budget. Recorded per row and part of the resume key, so on/off runs "
+         "never collide. (The **single run** above uses its own sidebar toggle "
+         "instead — this one is sweep-only.)")
 fixed_params = dict(
     model_name=model_name, complexity=float(complexity),
     center_x=float(center_x), center_y=float(center_y),
     n_eval=int(n_eval), grid_res=int(grid_res), extract_q=float(extract_q),
     sel_mode=sel_mode, shift_center_x=float(scx), shift_center_y=float(scy),
-    shift_spread=float(shift_spread), seed=int(seed),
-)  # radius is swept (incl. 0.0 = no weakspot), so it is NOT fixed here
+    shift_spread=float(shift_spread),
+    early_stopping=bool(sweep_early_stop),
+)  # radius & seed are swept, so they are NOT fixed here
 all_combos = SW.parameter_grid()
 total_runs = len(all_combos)
 remaining = SW.remaining_combos(fixed_params, SW.CSV_PATH)
@@ -330,7 +396,7 @@ with col_l:
 with col_r:
     st.subheader("Parameter Sweep")
     st.caption(
-        f"Runs the full grid ({total_runs} configs × 17 detectors), appending each "
+        f"Runs the full grid ({total_runs} configs × {len(SW.SWEEP_DETECTORS)} detectors), appending each "
         f"config's rows to CSV. **Resumable** — completed configs are skipped."
     )
     ci1, ci2, ci3 = st.columns(3)
@@ -361,12 +427,12 @@ with col_r:
 
 st.markdown(
     f"""
-**Swept axes:** {', '.join(f'`{k}`×{len(v)}' for k, v in SW.SWEEP_GRID.items())}.
-`radius`=0.0 configs induce **no weakspot** (full-dataset baseline).
-**Detectors:** all 17 (one CSV row each).
+**Swept axes:** {', '.join(f'`{k}`×{len(v)}' for k, v in SW.SWEEP_GRID.items() if len(v) > 1)}.
+**Detectors:** top {len(SW.SWEEP_DETECTORS)} from the ensemble paper (one CSV row each).
 **Held fixed at sidebar values:** model=`{model_name}`, complexity=`{complexity}`,
 weakspot centre=({center_x}, {center_y}), n_eval=`{n_eval}`,
-grid_res=`{grid_res}`, extract_q=`{extract_q}`, selection rule=`{sel_mode}`, seed=`{seed}`.
+grid_res=`{grid_res}`, extract_q=`{extract_q}`, selection rule=`{sel_mode}`
+(`seed` is now swept). The sidebar `seed` still controls the **single run**.
 
 **Estimated time** (~{SW.SECS_PER_RUN:.0f} s/config): full sweep ≈ **{est_total_min:.0f} min**
 · remaining ≈ **{est_remain_min:.0f} min**.  **CSV:** `{SW.CSV_PATH}` ·
@@ -592,9 +658,12 @@ with tabs[4]:
 # ── ⑥ RETRAINING ─────────────────────────────────────────────
 with tabs[5]:
     st.subheader("Step 6 — Retraining (new points only)")
+    _tm = R.get("training_mode", "From scratch (retrain)")
+    _how = ("continued from the initial model's weights and **fine-tuned** on"
+            if _tm.startswith("Warm") else "trained **from scratch** on")
     st.caption(
-        f"Each model is retrained **from scratch on only its {R['n_select']} newly "
-        f"selected points** — the original training set is **not** reused. "
+        f"**Training mode: {_tm}.** Each model is {_how} only its {R['n_select']} "
+        f"newly selected points — the original training set is **not** reused. "
         f"(**{R['model_name']}**, {R['iters_retrain']} iterations.) The dashed circle "
         f"marks the induced weakspot; note how tightly the weakspot-guided training "
         f"set clusters there compared with the spread-out random baseline."

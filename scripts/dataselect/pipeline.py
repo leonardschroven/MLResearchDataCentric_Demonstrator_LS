@@ -183,26 +183,47 @@ def selection_weights(X_pool, center, sigma: float, method: str = DEFAULT_SEL_ME
 
 def select_by_weakspot(X_pool, center, sigma: float, n_select: int, rng,
                        mode: str = "Sample ∝ weight",
-                       method: str = DEFAULT_SEL_METHOD, ext=None, surf=None):
+                       method: str = DEFAULT_SEL_METHOD, ext=None, surf=None,
+                       mix_ratio: float = 1.0):
     """Pick ``n_select`` candidate indices for retraining, per the chosen strategy.
 
     ``method`` selects the weighting strategy (see :func:`selection_weights`);
     ``mode`` = "Sample ∝ weight" (stochastic, weighted-without-replacement) or
-    "Top-weighted" (deterministic, the highest-weight points). The default
-    ``method`` reproduces the original distance-kernel behaviour exactly, so
-    existing call sites and swept results are unchanged.
+    "Top-weighted" (deterministic, the highest-weight points).
+
+    ``mix_ratio`` (α) ∈ [0,1] is the fraction chosen by the weakspot kernel; the
+    remaining (1-α) points are drawn **uniformly** from the rest of the pool —
+    rehearsal/coverage that combats the forgetting caused by over-concentrating on
+    the weakspot. α=1.0 reproduces the original pure-guided behaviour *exactly*
+    (same RNG draw), so existing call sites and swept results are unchanged; α=0.0
+    is pure uniform (≡ the random baseline).
     Returns (indices, weights).
     """
     n_select = int(min(n_select, len(X_pool)))
     w = selection_weights(X_pool, center, sigma, method, ext=ext, surf=surf) + 1e-12
     if n_select <= 0:
         return np.array([], dtype=int), w
-    if mode.startswith("Top"):
-        idx = np.argsort(w)[-n_select:][::-1]
+    a = float(np.clip(mix_ratio, 0.0, 1.0))
+    n_guided = int(round(a * n_select))
+    n_uniform = n_select - n_guided
+    # guided pick (weakspot kernel)
+    if n_guided > 0:
+        if mode.startswith("Top"):
+            g_idx = np.argsort(w)[-n_guided:][::-1]
+        else:
+            p = w / w.sum()
+            g_idx = rng.choice(len(X_pool), size=n_guided, replace=False, p=p)
     else:
-        p = w / w.sum()
-        idx = rng.choice(len(X_pool), size=n_select, replace=False, p=p)
-    return idx, w
+        g_idx = np.array([], dtype=int)
+    # uniform rehearsal pick from the remaining candidates
+    if n_uniform > 0:
+        remaining = np.setdiff1d(np.arange(len(X_pool)), g_idx)
+        take = int(min(n_uniform, len(remaining)))
+        u_idx = (rng.choice(remaining, size=take, replace=False)
+                 if take > 0 else np.array([], dtype=int))
+    else:
+        u_idx = np.array([], dtype=int)
+    return np.concatenate([g_idx, u_idx]).astype(int), w
 
 
 # ─────────────────────────────────────────────────────────────

@@ -30,14 +30,28 @@ st.markdown(
     "uniformly random new points; **Initial** = model before any selection."
 )
 
-CSV_PATH = Path("data/experiment_results/data_selective_training_sweep.csv")
+RESULTS_DIR = Path("data/experiment_results")
+# One results file per sweep config: sweep__<config>.csv (newest first). The legacy
+# single-file name is included if it still exists.
+_csv_files = sorted(RESULTS_DIR.glob("sweep__*.csv"),
+                    key=lambda p: p.stat().st_mtime, reverse=True)
+_legacy = RESULTS_DIR / "data_selective_training_sweep.csv"
+if _legacy.exists():
+    _csv_files.append(_legacy)
 
-if not CSV_PATH.exists():
+if not _csv_files:
     st.warning(
-        f"No sweep CSV at `{CSV_PATH}`. Open **Data-Selective Training** and run "
-        "the parameter sweep first."
+        "No sweep results found in `data/experiment_results/` (expected "
+        "`sweep__<config>.csv`). Open **Data-Selective Training**, choose a sweep "
+        "configuration, and run the parameter sweep first."
     )
     st.stop()
+
+_pick = st.sidebar.selectbox(
+    "Results file (per sweep config)", [p.name for p in _csv_files], index=0,
+    help="One file per sweep configuration (`sweep__<config>.csv`). Pick which "
+         "sweep's results to explore — e.g. the broad sweep or a focused isolate.")
+CSV_PATH = RESULTS_DIR / _pick
 
 
 @st.cache_data(show_spinner=False)

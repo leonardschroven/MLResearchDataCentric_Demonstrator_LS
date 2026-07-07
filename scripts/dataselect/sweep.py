@@ -2,7 +2,7 @@
 Parameter sweep for the Data-Selective Training experiment.
 
 Each configuration runs the whole pipeline and writes **one row per detector**
-(all 17 detectors share the config's initial training + evaluation, exactly like
+(the top-5 detectors share the config's initial training + evaluation, exactly like
 the weakspot sweep writes one row per method):
 
     setup → initial train → evaluate → for each detector:
@@ -19,12 +19,14 @@ rows at that value, so expanding the grid never restarts from scratch. Rows for
 one config are appended together, so a key only appears once the config is fully
 done.
 
-Cost: ~6 s per configuration (17 detectors). Estimated total time is roughly
-``(product of swept-axis lengths) x 6 s`` — see the page for a live estimate.
+Cost: ~2.1 s per configuration (top-5 detectors). Estimated total time is roughly
+``(product of swept-axis lengths) x 2.1 s`` — see the page for a live estimate.
 """
 from __future__ import annotations
 
 import itertools
+import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -38,82 +40,106 @@ from scripts.weakspot.extraction import (
 from scripts.dataselect import pipeline as P
 
 
-CSV_PATH = Path("data/experiment_results/data_selective_training_sweep.csv")
-
 GRID_RES_DEFAULT = 35      # ideal grid resolution from the weakspot paper
 EXTRACT_QUANTILE = 0.85    # stage-2 extraction threshold
 IOU_HEADLINE_Q = 0.90      # IoU quantile recorded per row
-SECS_PER_RUN = 6.0         # benchmarked ~5.6 s + overhead, one config = 17 rows
-
-
-# ─────────────────────────────────────────────────────────────
-# Swept axes.  Edit any list and rerun — resume skips completed configs.
-# Time ≈ (product of the lengths below) × ~6 s.  Current default: 62,208 configs.
-#
-# ``radius`` sweeps the gap size starting from 0.0 — a special value that induces
-# NO weakspot (the initial model trains on the full dataset, so its weakness
-# comes only from noise / shift / complexity / finite data). radius > 0 induces a
-# circular data gap of that size.
-#
-# To sweep the axes fixed to a single value below, just add values, e.g.
-#   "n_train":     [300, 800, 1500],
-#   "n_candidate": [1000, 2000, 3000],
-# ─────────────────────────────────────────────────────────────
-SWEEP_GRID = {
-    # --- data pool ---
-    "n_bumps":       [1, 3, 5],
-    "noise_std":     [0.05, 0.30],
-    "n_pool_total":  [1000, 2000],
-    "shift_strength":[0.0, 0.6],
-    # --- induced weakspot: gap size, 0.0 = no weakspot (full-dataset baseline) ---
-    "radius":        [0.0, 0.06, 0.12, 0.18],
-    # --- initial training ---
-    "iters_initial": [25, 50, 100, 150, 200, 300],
-    "n_train":       [800],
-    # --- data selection ---
-    "sel_sigma":     [0.05, 0.15, 0.25, 0.35, 0.45, 0.50],
-    "n_select":      [100, 500, 1000],
-    "n_candidate":   [2000],
-    # selection strategy — the first value is the LEGACY method that every row in
-    # the pre-existing CSV used. It is deliberately omitted from the resume key
-    # (see make_param_key) so those rows are reused, not re-run; the two new
-    # strategies get fresh keys and are swept on top of the existing results.
-    "sel_method":    list(P.SEL_METHODS),
-    # --- retraining ---
-    "iters_retrain": [25, 50, 100, 150, 200, 250],
-}
+_IOU_COL = f"iou_q{int(IOU_HEADLINE_Q * 100)}"
 
 # The selection method that predates the ``sel_method`` axis; all historical rows
 # used it, so it is treated as the key-neutral default for backward-compatible resume.
 LEGACY_SEL_METHOD = P.DEFAULT_SEL_METHOD
 
-# Held fixed at the page's sidebar values when the sweep is launched.
-# (``radius`` is swept above, so it is intentionally NOT here.)
+# Held fixed at the page's sidebar values when the sweep is launched (these are NOT
+# part of the config grid). ``early_stopping`` default True is key-neutral (see
+# make_param_key) so it matches historical rows; False produces distinct keys.
 FIXED_FIELDS = (
     "model_name", "complexity", "center_x", "center_y",
     "n_eval", "grid_res", "extract_q", "sel_mode",
-    "shift_center_x", "shift_center_y", "shift_spread", "seed",
+    "shift_center_x", "shift_center_y", "shift_spread",
+    "early_stopping",
 )
 
-# Full parameter set — the resume key spans every field so grid growth is safe.
-KEY_FIELDS = tuple(SWEEP_GRID.keys()) + FIXED_FIELDS
 
-# Canonical CSV column order. Every row is reindexed to this before it is written,
-# so appended chunks always have identical columns — including the optional
-# ``error`` column — regardless of whether a config had a detector failure. Without
-# this, a batch containing a failure gained an extra ``error`` column and the CSV
-# became unparseable (ragged rows).
-_IOU_COL = f"iou_q{int(IOU_HEADLINE_Q * 100)}"
-COLUMNS = (
-    ["param_key"] + list(SWEEP_GRID.keys()) + list(FIXED_FIELDS)
-    + ["method", "n_selected", "distance", _IOU_COL,
-       "centroid_x1", "centroid_x2", "sigma_x1", "sigma_x2", "area_frac",
-       "init_rmse", "init_mae", "init_r2", "init_err_in", "init_err_out",
-       "guided_rmse", "guided_mae", "guided_r2", "guided_err_in", "guided_err_out",
-       "base_rmse", "base_mae", "base_r2", "base_err_in", "base_err_out",
-       "d_mae_guided", "d_mae_base", "gap_mae_guided_minus_base",
-       "d_errin_guided", "d_errin_base", "error"]
-)
+# ─────────────────────────────────────────────────────────────
+# Sweep configuration is loaded from a JSON file in ``sweep_configs/`` instead of
+# being hardcoded, so multiple grids can coexist — a broad general sweep plus
+# narrower configs that isolate a few dimensions. Each config writes to its own CSV,
+# ``sweep__<config-name>.csv``, and every row carries a ``sweep_config`` column, so a
+# results file is always traceable to the config that produced it. The active config
+# defaults to ``DEFAULT_CONFIG`` and can be overridden with the ``SWEEP_CONFIG`` env
+# var; parallel workers re-import this module and read the same var, so they agree.
+# ─────────────────────────────────────────────────────────────
+CONFIG_DIR = Path(__file__).parent / "sweep_configs"
+RESULTS_DIR = Path("data/experiment_results")
+DEFAULT_CONFIG = "alpha_boundary"
+
+
+def available_configs() -> list[str]:
+    """Names (filename stems) of every sweep config JSON, sorted."""
+    return sorted(p.stem for p in CONFIG_DIR.glob("*.json"))
+
+
+def load_config(name: str) -> dict:
+    """Load and validate a sweep config by name (filename without ``.json``)."""
+    path = CONFIG_DIR / f"{name}.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Sweep config '{name}' not found at {path}")
+    with open(path, encoding="utf-8") as f:
+        cfg = json.load(f)
+    cfg.setdefault("name", name)
+    cfg.setdefault("secs_per_run", 2.1)
+    if not cfg.get("grid"):
+        raise ValueError(f"Sweep config '{name}' has no non-empty 'grid'.")
+    unknown = [d for d in cfg.get("detectors", []) if d not in DETECTION_METHODS]
+    if unknown:
+        raise ValueError(f"Sweep config '{name}' lists unknown detectors: {unknown}")
+    return cfg
+
+
+def sweep_csv_path(name: str) -> Path:
+    """Results CSV for a config — the config name is baked into the filename."""
+    return RESULTS_DIR / f"sweep__{name}.csv"
+
+
+def _build_columns() -> list[str]:
+    # Canonical CSV column order. Every row is reindexed to this before writing, so
+    # appended chunks always share identical columns (incl. the optional ``error``
+    # column) — otherwise a batch with a detector failure gains a column and the CSV
+    # becomes ragged/unparseable.
+    return (
+        ["param_key", "sweep_config"] + list(SWEEP_GRID.keys()) + list(FIXED_FIELDS)
+        + ["method", "n_selected", "distance", _IOU_COL,
+           "centroid_x1", "centroid_x2", "sigma_x1", "sigma_x2", "area_frac",
+           "init_rmse", "init_mae", "init_r2", "init_err_in", "init_err_out",
+           "guided_rmse", "guided_mae", "guided_r2", "guided_err_in", "guided_err_out",
+           "base_rmse", "base_mae", "base_r2", "base_err_in", "base_err_out",
+           "d_mae_guided", "d_mae_base", "gap_mae_guided_minus_base",
+           "d_errin_guided", "d_errin_base", "error"]
+    )
+
+
+def _apply_config(cfg: dict) -> None:
+    """Populate the module-level globals derived from a loaded config."""
+    global ACTIVE_CONFIG, SWEEP_CONFIG_NAME, SWEEP_GRID, SWEEP_DETECTORS
+    global SECS_PER_RUN, CSV_PATH, KEY_FIELDS, COLUMNS
+    ACTIVE_CONFIG = cfg
+    SWEEP_CONFIG_NAME = cfg["name"]
+    SWEEP_GRID = cfg["grid"]
+    SWEEP_DETECTORS = list(cfg["detectors"])
+    SECS_PER_RUN = float(cfg["secs_per_run"])
+    CSV_PATH = sweep_csv_path(cfg["name"])
+    KEY_FIELDS = tuple(SWEEP_GRID.keys()) + FIXED_FIELDS   # resume key spans every field
+    COLUMNS = _build_columns()
+
+
+def set_active_config(name: str) -> None:
+    """Switch the active sweep config (updates globals + env so workers agree)."""
+    os.environ["SWEEP_CONFIG"] = name
+    _apply_config(load_config(name))
+
+
+# Initialise at import from the env override (default = the shipped config).
+_apply_config(load_config(os.environ.get("SWEEP_CONFIG", DEFAULT_CONFIG)))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -136,6 +162,13 @@ def make_param_key(params: dict) -> str:
     parts = []
     for k in sorted(KEY_FIELDS):
         if k == "sel_method" and str(params.get(k, LEGACY_SEL_METHOD)) == LEGACY_SEL_METHOD:
+            continue
+        # early_stopping=True is the historical default → omit from the key so those
+        # runs stay key-compatible; False keeps the field and gets distinct keys.
+        if k == "early_stopping" and bool(params.get(k, True)):
+            continue
+        # mix_ratio=1.0 is pure guided (historical default) → key-neutral.
+        if k == "mix_ratio" and float(params.get(k, 1.0)) == 1.0:
             continue
         parts.append(f"{k}={params[k]}")
     return "|".join(parts)
@@ -196,7 +229,7 @@ def safe_run_one(params: dict) -> list[dict]:
 
 
 def run_one(params: dict) -> list[dict]:
-    """Run one configuration; return one row per detector (17 rows)."""
+    """Run one configuration; return one row per detector (top-5 → 5 rows)."""
     pkey = make_param_key(params)
     rng = np.random.RandomState(int(params["seed"]))
     center = np.array([params["center_x"], params["center_y"]])
@@ -206,6 +239,7 @@ def run_one(params: dict) -> list[dict]:
     extract_q = float(params["extract_q"])
     n_select = int(params["n_select"])
     iters_retrain = int(params["iters_retrain"])
+    es = bool(params.get("early_stopping", True))   # MLP early stopping (default on)
 
     # ---- setup ----
     X_all = P.sample_inputs(
@@ -237,7 +271,7 @@ def run_one(params: dict) -> list[dict]:
     # ---- initial train + eval ----
     model0 = build_model(AVAILABLE_MODELS[params["model_name"]],
                          complexity=float(params["complexity"]),
-                         iterations=int(params["iters_initial"]))
+                         iterations=int(params["iters_initial"]), early_stopping=es)
     model0.fit(X_tr0, y_tr0)
     _, err0, mi = P.evaluate(model0, X_eval, y_eval)
     ein0, eout0 = _region(err0)
@@ -251,7 +285,7 @@ def run_one(params: dict) -> list[dict]:
     rand_idx = rng.choice(len(X_cand), size=n_sel, replace=False)
     modelR = build_model(AVAILABLE_MODELS[params["model_name"]],
                          complexity=float(params["complexity"]),
-                         iterations=iters_retrain)
+                         iterations=iters_retrain, early_stopping=es)
     modelR.fit(X_cand[rand_idx], y_cand[rand_idx])
     _, errR, mb = P.evaluate(modelR, X_eval, y_eval)
     einR, eoutR = _region(errR)
@@ -265,9 +299,10 @@ def run_one(params: dict) -> list[dict]:
         "init_err_in": ein0, "init_err_out": eout0,
     }
 
-    # ---- per-detector guided selection + retrain ----
+    # ---- per-detector guided selection + retrain (top-5 detectors only) ----
     rows = []
-    for name, fn in DETECTION_METHODS.items():
+    for name in SWEEP_DETECTORS:
+        fn = DETECTION_METHODS[name]
         try:
             surf0 = P.normalize_surface(fn(X_eval, err0, grid_flat))
             ext = extract_weakspot(surf0, xx, yy, threshold_quantile=extract_q)
@@ -287,16 +322,17 @@ def run_one(params: dict) -> list[dict]:
                 X_cand, c, float(params["sel_sigma"]), n_select, rng,
                 mode=params["sel_mode"],
                 method=params.get("sel_method", LEGACY_SEL_METHOD),
-                ext=ext, surf=surf0)
+                ext=ext, surf=surf0, mix_ratio=float(params.get("mix_ratio", 1.0)))
             model1 = build_model(AVAILABLE_MODELS[params["model_name"]],
                                  complexity=float(params["complexity"]),
-                                 iterations=iters_retrain)
+                                 iterations=iters_retrain, early_stopping=es)
             model1.fit(X_cand[sel_idx], y_cand[sel_idx])
             _, err1, mg = P.evaluate(model1, X_eval, y_eval)
             eing, eoutg = _region(err1)
 
             row = {
-                "param_key": pkey, **params, "method": name,
+                "param_key": pkey, "sweep_config": SWEEP_CONFIG_NAME,
+                **params, "method": name,
                 "n_selected": int(len(sel_idx)),
                 # weakspot-ID metrics (pre-retrain)
                 "distance": dist, f"iou_q{int(IOU_HEADLINE_Q*100)}":
@@ -316,7 +352,8 @@ def run_one(params: dict) -> list[dict]:
                 "d_errin_base": einR - ein0,
             }
         except Exception as e:  # keep the sweep going; record the failure
-            row = {"param_key": pkey, **params, "method": name, "error": str(e)}
+            row = {"param_key": pkey, "sweep_config": SWEEP_CONFIG_NAME,
+                   **params, "method": name, "error": str(e)}
         rows.append(row)
 
     return rows
