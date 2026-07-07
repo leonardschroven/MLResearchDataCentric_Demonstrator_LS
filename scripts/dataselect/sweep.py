@@ -70,7 +70,8 @@ FIXED_FIELDS = (
 # var; parallel workers re-import this module and read the same var, so they agree.
 # ─────────────────────────────────────────────────────────────
 CONFIG_DIR = Path(__file__).parent / "sweep_configs"
-RESULTS_DIR = Path("data/experiment_results")
+# Per-experiment subfolder so this page's results sit apart from the weakspot ones.
+RESULTS_DIR = Path("data/experiment_results/data_selective_training")
 DEFAULT_CONFIG = "alpha_boundary"
 
 

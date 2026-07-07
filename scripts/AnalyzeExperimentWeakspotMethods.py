@@ -1,5 +1,5 @@
 """
-Analyse the parameter-sweep results in ``data/experiment_results/sweep_results.csv``
+Analyse the parameter-sweep results in ``data/experiment_results/weakspot_experiment/sweep_results.csv``
 and produce a self-contained set of PNG figures + a summary CSV that
 describe how each of the 17 detection methods performs.
 
@@ -40,7 +40,7 @@ import plotly.graph_objects as go
 # ─────────────────────────────────────────────────────────────
 # Paths (relative — run from repo root)
 # ─────────────────────────────────────────────────────────────
-CSV_PATH = Path("data/experiment_results/sweep_results.csv")
+CSV_PATH = Path("data/experiment_results/weakspot_experiment/sweep_results.csv")
 OUT_DIR  = Path("figures/Experiment_WeakspotAnalyzer")
 
 PRIMARY = "iou_q90"

@@ -436,7 +436,7 @@ from scripts.weakspot.sweep import (
 )
 import time
 
-CSV_PATH = Path("data/experiment_results/sweep_results.csv")
+CSV_PATH = Path("data/experiment_results/weakspot_experiment/sweep_results.csv")
 
 fixed_params = {
     "dataset_key": AVAILABLE_DATASETS[dataset_name],

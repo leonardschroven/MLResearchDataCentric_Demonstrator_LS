@@ -7,7 +7,7 @@ Generate the five PNG figures referenced by ``Documents/Paper_Advanced.../main.t
     sensitivity_complexity.png
     sensitivity_radius.png
 
-Source: ``data/experiment_results/sweep_results.csv`` (the live sweep CSV).
+Source: ``data/experiment_results/weakspot_experiment/sweep_results.csv`` (the live sweep CSV).
 Output: ``Documents/Paper_Advanced EnsembleMethods/Paper_Advanced-Ensembles-for-Weakspot-Identification/figures/``.
 
 Runs gracefully when the sweep is partial — uses whatever rows are present.
@@ -24,7 +24,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 
-CSV_PATH = Path("data/experiment_results/sweep_results.csv")
+CSV_PATH = Path("data/experiment_results/weakspot_experiment/sweep_results.csv")
 OUT_DIR  = Path(
     "Documents/Paper_Advanced EnsembleMethods/"
     "Paper_Advanced-Ensembles-for-Weakspot-Identification/figures"

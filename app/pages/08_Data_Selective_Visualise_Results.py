@@ -30,7 +30,7 @@ st.markdown(
     "uniformly random new points; **Initial** = model before any selection."
 )
 
-RESULTS_DIR = Path("data/experiment_results")
+RESULTS_DIR = Path("data/experiment_results/data_selective_training")
 # One results file per sweep config: sweep__<config>.csv (newest first). The legacy
 # single-file name is included if it still exists.
 _csv_files = sorted(RESULTS_DIR.glob("sweep__*.csv"),
@@ -41,7 +41,7 @@ if _legacy.exists():
 
 if not _csv_files:
     st.warning(
-        "No sweep results found in `data/experiment_results/` (expected "
+        "No sweep results found in `data/experiment_results/data_selective_training/` (expected "
         "`sweep__<config>.csv`). Open **Data-Selective Training**, choose a sweep "
         "configuration, and run the parameter sweep first."
     )

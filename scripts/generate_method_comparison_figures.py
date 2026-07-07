@@ -6,7 +6,7 @@ Generate the method-comparison bar charts referenced by ``main.tex``:
     advanced_distance.png   mean centroid distance, all 17 methods, coloured by tier
     advanced_iou.png        mean IoU@q=0.90, all 17 methods, coloured by tier
 
-Source : data/experiment_results/sweep_results.csv (the live sweep CSV).
+Source : data/experiment_results/weakspot_experiment/sweep_results.csv (the live sweep CSV).
 Output : straight into the paper's figures/ folder, so no manual copy is needed.
 
 Design goals (per paper feedback):
@@ -27,7 +27,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 
-CSV_PATH = Path("data/experiment_results/sweep_results.csv")
+CSV_PATH = Path("data/experiment_results/weakspot_experiment/sweep_results.csv")
 OUT_DIR = Path(
     "Documents/Paper_Advanced EnsembleMethods/"
     "Paper_Advanced-Ensembles-for-Weakspot-Identification/figures"

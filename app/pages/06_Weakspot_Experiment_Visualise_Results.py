@@ -1,6 +1,6 @@
 """
 Sweep Results — visual comparison of the 8 detection methods across all
-parameter-sweep runs saved to `data/experiment_results/sweep_results.csv`.
+parameter-sweep runs saved to `data/experiment_results/weakspot_experiment/sweep_results.csv`.
 
 Each CSV row is one (config × method) result. This page groups by method so
 you can see, across many configs, which methods locate the induced weakspot
@@ -28,7 +28,7 @@ st.markdown(
     "**centroid distance**, and **sensitivity to sweep parameters**."
 )
 
-CSV_PATH = Path("data/experiment_results/sweep_results.csv")
+CSV_PATH = Path("data/experiment_results/weakspot_experiment/sweep_results.csv")
 
 if not CSV_PATH.exists():
     st.warning(
