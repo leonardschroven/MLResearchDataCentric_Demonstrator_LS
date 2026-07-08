@@ -1,6 +1,6 @@
 {
   "name": "alpha_boundary",
-  "description": "Broad general sweep — WARM-START version (the corrected default). Same grid as the frozen alpha_boundary_scratch, but every retrain continues the initial model's weights on the new points (warm_start=true) instead of training from scratch, so the global-MAE regression from catastrophic forgetting is largely removed. Writes to its own fresh file sweep__alpha_boundary.csv; the scratch reference is left untouched for a scratch-vs-warm comparison. Probes the rehearsal-mix alpha x gap-size (radius) boundary with the selection and retraining axes; initial-training time iters_initial [10,20,50,100,200] is widened to bracket the ~50 whole-area sweet spot (where the initial model is undertrained enough for a real weakspot, so guided can win over the whole area, not just in the gap). mix_ratio extended down to 0.25 to reach the whole-area sweet spot (more rehearsal). Top-5 detectors. ~720,000 configs (~7-8 h on 60 vCores).",
+  "description": "Broad general sweep — WARM-START version (the corrected default). Same grid as the frozen alpha_boundary_scratch, but every retrain continues the initial model's weights on the new points (warm_start=true) instead of training from scratch, so the global-MAE regression from catastrophic forgetting is largely removed. Writes to its own fresh file sweep__alpha_boundary.csv; the scratch reference is left untouched for a scratch-vs-warm comparison. Probes the rehearsal-mix alpha x gap-size (radius) boundary with the selection and retraining axes; initial-training time iters_initial [10,20,50,100,200] is widened to bracket the ~50 whole-area sweet spot (where the initial model is undertrained enough for a real weakspot, so guided can win over the whole area, not just in the gap). mix_ratio spans 0.0-1.0 (incl. the more-rehearsal whole-area sweet spot). Trimmed the dominated / over-training values (n_train 2500, n_select 50, radius 0.08, iters_retrain 300) to slim runtime. Top-5 detectors. ~324,000 configs (~3-4 h on 60+ vCores).",
   "secs_per_run": 2.1,
   "detectors": [
     "EVT × GPR (geometric)",
@@ -14,15 +14,15 @@
     "noise_std":      [0.0, 0.05, 0.1],
     "n_pool_total":   [2000],
     "shift_strength": [0.0],
-    "radius":         [0.0, 0.08, 0.12, 0.18],
+    "radius":         [0.0, 0.12, 0.18],
     "iters_initial":  [10, 20, 50, 100, 200],
-    "n_train":        [200, 400, 800, 1500, 2500],
+    "n_train":        [200, 400, 800, 1500],
     "sel_sigma":      [0.05, 0.1, 0.2, 0.3, 0.5],
-    "n_select":       [50, 100, 300, 500, 700],
+    "n_select":       [100, 300, 500, 700],
     "n_candidate":    [2000],
     "sel_method":     ["Weakpoint distance", "Weight by landscape", "Shape aware"],
-    "mix_ratio":      [0.25, 0.5, 0.75, 1.0],
-    "iters_retrain":  [100, 200, 300, 400],
+    "mix_ratio":      [0.0, 0.25, 0.5, 0.75, 1.0],
+    "iters_retrain":  [100, 200, 400],
     "warm_start":     [true],
     "seed":           [42]
   }
