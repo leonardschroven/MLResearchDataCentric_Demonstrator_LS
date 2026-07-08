@@ -24,6 +24,7 @@ Cost: ~2.1 s per configuration (top-5 detectors). Estimated total time is roughl
 """
 from __future__ import annotations
 
+import copy
 import itertools
 import json
 import os
@@ -72,7 +73,7 @@ FIXED_FIELDS = (
 CONFIG_DIR = Path(__file__).parent / "sweep_configs"
 # Per-experiment subfolder so this page's results sit apart from the weakspot ones.
 RESULTS_DIR = Path("data/experiment_results/data_selective_training")
-DEFAULT_CONFIG = "alpha_boundary"
+DEFAULT_CONFIG = "alpha_boundary_scratch"
 
 
 def available_configs() -> list[str]:
@@ -242,6 +243,28 @@ def run_one(params: dict) -> list[dict]:
     iters_retrain = int(params["iters_retrain"])
     es = bool(params.get("early_stopping", True))   # MLP early stopping (default on)
 
+    # Warm-start (default ON): the retrain *continues* the initial model's weights on
+    # the newly selected points (transfer / fine-tune) instead of training a fresh
+    # model from scratch. Implemented for the MLP only (other algorithms fall back to
+    # from-scratch). Mirrors the single-run page's _retrain so page and sweep agree.
+    warm = (bool(params.get("warm_start", True))
+            and AVAILABLE_MODELS[params["model_name"]] == "mlp")
+
+    def _retrain(base, X, y):
+        """Retrain on the new points ONLY. Warm-start deep-copies ``base`` and keeps
+        its weights (continued training); from-scratch builds a brand-new model.
+        Both the guided model and the random baseline retrain via this same function
+        from the *same* initial model, so the head-to-head stays fair."""
+        if warm:
+            m = copy.deepcopy(base)
+            m.named_steps["model"].max_iter = iters_retrain
+        else:
+            m = build_model(AVAILABLE_MODELS[params["model_name"]],
+                            complexity=float(params["complexity"]),
+                            iterations=iters_retrain, early_stopping=es)
+        m.fit(X, y)
+        return m
+
     # ---- setup ----
     X_all = P.sample_inputs(
         int(params["n_pool_total"]), rng,
@@ -270,9 +293,11 @@ def run_one(params: dict) -> list[dict]:
         return P.region_error(X_eval, err, center, r) if r > 0 else (float("nan"), float("nan"))
 
     # ---- initial train + eval ----
+    # Built with warm_start=warm so its weights can be continued by the retrains.
     model0 = build_model(AVAILABLE_MODELS[params["model_name"]],
                          complexity=float(params["complexity"]),
-                         iterations=int(params["iters_initial"]), early_stopping=es)
+                         iterations=int(params["iters_initial"]),
+                         warm_start=warm, early_stopping=es)
     model0.fit(X_tr0, y_tr0)
     _, err0, mi = P.evaluate(model0, X_eval, y_eval)
     ein0, eout0 = _region(err0)
@@ -284,10 +309,7 @@ def run_one(params: dict) -> list[dict]:
     # ---- random baseline (detector-independent, computed once) ----
     n_sel = min(n_select, len(X_cand))
     rand_idx = rng.choice(len(X_cand), size=n_sel, replace=False)
-    modelR = build_model(AVAILABLE_MODELS[params["model_name"]],
-                         complexity=float(params["complexity"]),
-                         iterations=iters_retrain, early_stopping=es)
-    modelR.fit(X_cand[rand_idx], y_cand[rand_idx])
+    modelR = _retrain(model0, X_cand[rand_idx], y_cand[rand_idx])
     _, errR, mb = P.evaluate(modelR, X_eval, y_eval)
     einR, eoutR = _region(errR)
 
@@ -324,10 +346,7 @@ def run_one(params: dict) -> list[dict]:
                 mode=params["sel_mode"],
                 method=params.get("sel_method", LEGACY_SEL_METHOD),
                 ext=ext, surf=surf0, mix_ratio=float(params.get("mix_ratio", 1.0)))
-            model1 = build_model(AVAILABLE_MODELS[params["model_name"]],
-                                 complexity=float(params["complexity"]),
-                                 iterations=iters_retrain, early_stopping=es)
-            model1.fit(X_cand[sel_idx], y_cand[sel_idx])
+            model1 = _retrain(model0, X_cand[sel_idx], y_cand[sel_idx])
             _, err1, mg = P.evaluate(model1, X_eval, y_eval)
             eing, eoutg = _region(err1)
 

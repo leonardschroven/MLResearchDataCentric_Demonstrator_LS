@@ -22,8 +22,8 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-st.set_page_config(page_title="Data-Selective — Visualise Results", layout="wide")
-st.title("📊 Data-Selective Training — Visualise Results")
+st.set_page_config(page_title="Data Selective Training Visualise Results", layout="wide")
+st.title("📊 Data Selective Training — Visualise Results")
 st.markdown(
     "Aggregated comparison across the sweep. **Guided** = model retrained on new "
     "points selected around the detected weakspot; **Baseline** = same number of "
@@ -47,23 +47,112 @@ if not _csv_files:
     )
     st.stop()
 
+# Nothing is loaded until a file is explicitly chosen — the placeholder is the
+# default, so simply opening the page never reads a (possibly multi-GB) results CSV.
+_PLACEHOLDER = "— choose a results file —"
 _pick = st.sidebar.selectbox(
-    "Results file (per sweep config)", [p.name for p in _csv_files], index=0,
+    "Results file (per sweep config)", [_PLACEHOLDER] + [p.name for p in _csv_files],
+    index=0,
     help="One file per sweep configuration (`sweep__<config>.csv`). Pick which "
-         "sweep's results to explore — e.g. the broad sweep or a focused isolate.")
+         "sweep's results to explore — e.g. the broad sweep or a focused isolate. "
+         "Loading only starts once you pick a file here.")
+if _pick == _PLACEHOLDER:
+    st.info(
+        "⬅ **Pick a results file in the sidebar** to load and explore it. Each file "
+        "is one sweep configuration (`sweep__<config>.csv`); large files are "
+        "subsampled in safe mode so the page stays responsive.")
+    st.stop()
 CSV_PATH = RESULTS_DIR / _pick
 
+# ─────────────────────────────────────────────────────────────
+# SAFE MODE — the broad sweeps run to millions of rows / several GB. Reading such
+# a file whole (the old behaviour) exhausts RAM and hangs the page. Safe mode
+# (default ON) reads the CSV in chunks and keeps a **uniform random sample** up to
+# a row budget: because the sample is uniform, every group mean, win-rate and box
+# plot below stays an unbiased estimate of the full sweep — the page just works off
+# a representative subset. Files under the trigger size load whole regardless.
+# ─────────────────────────────────────────────────────────────
+SAFE_TRIGGER_MB = 250
+_size_mb = CSV_PATH.stat().st_size / 1e6
+st.sidebar.markdown("---")
+safe_mode = st.sidebar.checkbox(
+    "⚡ Safe mode (subsample huge files)", value=True,
+    help=f"This file is {_size_mb:,.0f} MB. Safe mode reads it in chunks and keeps a "
+         "uniform random sample up to the row budget below, so the page stays "
+         "responsive. Group means, win-rates and distributions remain unbiased "
+         "estimates of the full sweep. Turn off to load every row (can exhaust RAM "
+         "on multi-GB files).")
+row_budget = st.sidebar.select_slider(
+    "Row budget (safe mode)",
+    options=[50_000, 100_000, 150_000, 250_000, 500_000, 1_000_000],
+    value=150_000, disabled=not safe_mode,
+    help="Cap on rows loaded when safe mode subsamples a large file. 150k gives "
+         "stable aggregates; raise it for a more faithful (heavier) load.")
 
-@st.cache_data(show_spinner=False)
-def load_results(path: Path, mtime: float) -> pd.DataFrame:
-    try:
-        return pd.read_csv(path, low_memory=False)
-    except Exception:
-        # tolerate a partially-written or ragged line (e.g. a sweep in progress)
-        return pd.read_csv(path, engine="python", on_bad_lines="skip",
-                           low_memory=False)
 
-df = load_results(CSV_PATH, CSV_PATH.stat().st_mtime)
+def _estimate_rows(path: Path, size_bytes: int) -> int:
+    """Cheap total-row estimate: bytes-per-row from a 5 MB sample of the file."""
+    with open(path, "rb") as f:
+        f.readline()                       # skip header
+        sample = f.read(5_000_000)
+    nl = sample.count(b"\n")
+    if nl == 0:
+        return size_bytes // 200           # fallback guess
+    return int(size_bytes / (len(sample) / nl))
+
+
+@st.cache_data(show_spinner="Loading results…")
+def load_results(path: Path, mtime: float, safe: bool,
+                 budget: int) -> tuple[pd.DataFrame, int, int]:
+    """Return (df, est_total_rows, loaded_rows).
+
+    Small files (or safe mode off) load whole. Large files in safe mode are read in
+    250k-row chunks and uniformly subsampled to ``budget`` rows (unbiased). A fixed
+    random_state keeps the sample stable across reruns / cache hits.
+    """
+    size = path.stat().st_size
+
+    def _read_whole():
+        try:
+            return pd.read_csv(path, low_memory=False)
+        except Exception:                  # tolerate a ragged in-progress file
+            return pd.read_csv(path, engine="python", on_bad_lines="skip",
+                               low_memory=False)
+
+    if not safe or size < SAFE_TRIGGER_MB * 1e6:
+        d = _read_whole()
+        return d, len(d), len(d)
+
+    est = _estimate_rows(path, size)
+    keep_frac = min(1.0, budget / max(est, 1))
+    if keep_frac >= 1.0:
+        d = _read_whole()
+        return d, len(d), len(d)
+
+    frames = []
+    for engine_kwargs in ({}, {"engine": "python", "on_bad_lines": "skip"}):
+        try:
+            frames = [
+                ch.sample(frac=keep_frac, random_state=0)
+                for ch in pd.read_csv(path, chunksize=250_000,
+                                      low_memory=False, **engine_kwargs)
+            ]
+            break
+        except Exception:
+            frames = []
+            continue
+    d = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return d, est, len(d)
+
+
+df, _est_rows, _loaded_rows = load_results(
+    CSV_PATH, CSV_PATH.stat().st_mtime, safe_mode, int(row_budget))
+
+if safe_mode and _loaded_rows < _est_rows:
+    st.sidebar.caption(
+        f"Loaded **{_loaded_rows:,}** of ~**{_est_rows:,}** rows "
+        f"(~{100 * _loaded_rows / max(_est_rows, 1):.1f}% uniform sample · "
+        f"{_size_mb:,.0f} MB file).")
 
 # Rows swept before the selection-method axis existed all used the legacy strategy.
 if "sel_method" not in df.columns:
@@ -136,7 +225,9 @@ c1, c2, c3, c4 = st.columns(4)
 c1.metric("Detectors", df_f["method"].nunique())
 c2.metric("Unique configs", n_configs)
 c3.metric("Rows after filter", len(df_f))
-c4.metric("Total CSV rows", len(df))
+c4.metric("Loaded rows", f"{len(df):,}",
+          help=(f"Uniform sample of ~{_est_rows:,} rows in the full file "
+                f"(safe mode)." if _est_rows > len(df) else "Full file loaded."))
 
 if df_f.empty:
     st.error("No rows match the current filters.")

@@ -141,16 +141,18 @@ mix_ratio = st.sidebar.slider(
 
 st.sidebar.subheader("8. Retraining")
 training_mode = st.sidebar.radio(
-    "Training mode", ["From scratch (retrain)", "Warm-start (transfer)"], index=0,
+    "Training mode", ["Warm-start (transfer)", "From scratch (retrain)"], index=0,
     help="How the model learns from the newly selected points (in both cases it "
          "trains on the **new points only** — the original set is not reused).\n\n"
+         "• **Warm-start (transfer)** — *default.* The initial model's weights are "
+         "kept and *fine-tuned* on the new points (continued training, not a fresh "
+         "train). MLP only; other algorithms fall back to from scratch. The guided "
+         "model **and** the random baseline both warm-start from the *same* initial "
+         "model, so the head-to-head stays fair. The parameter sweep now defaults to "
+         "this too (each config's `warm_start` field, default true).\n"
          "• **From scratch** — a brand-new model is trained on the new points (the "
-         "original default; this is what the parameter sweep on the next page uses).\n"
-         "• **Warm-start (transfer)** — the initial model's weights are kept and "
-         "*fine-tuned* on the new points (a retrain, not a fresh train). MLP only; "
-         "other algorithms fall back to from scratch. The guided model **and** the "
-         "random baseline both warm-start from the *same* initial model, so the "
-         "head-to-head stays fair.")
+         "old default; retained for comparison and used by the frozen "
+         "`alpha_boundary_scratch` sweep).")
 early_stop = st.sidebar.checkbox(
     "Early stopping (regularise MLP)", value=True,
     help="MLP only. When on (default), training stops once a held-out validation "
@@ -343,7 +345,19 @@ st.markdown(
 # RUN OPTIONS — single experiment vs full parameter sweep
 # ─────────────────────────────────────────────────────────────
 import time
+from math import prod
 from scripts.dataselect import sweep as SW
+
+
+@st.cache_data(show_spinner="Checking which configs are already done…")
+def _completed_keys(path_str: str, mtime: float) -> set:
+    """Completed ``param_key`` set for resume, cached on (path, mtime).
+
+    Only called when a sweep is actually launched — never on page render — so the
+    potentially multi-GB results CSV is not scanned just to draw the page. Cached on
+    mtime so a resume within the same session reads it at most once."""
+    return SW.load_completed_keys(Path(path_str))
+
 
 st.header("🧪 Run Options")
 _cfg_names = SW.available_configs()
@@ -375,13 +389,18 @@ fixed_params = dict(
     shift_spread=float(shift_spread),
     early_stopping=bool(sweep_early_stop),
 )  # radius & seed are swept, so they are NOT fixed here
-all_combos = SW.parameter_grid()
-total_runs = len(all_combos)
-remaining = SW.remaining_combos(fixed_params, SW.CSV_PATH)
-n_done = total_runs - len(remaining)
-done_total = len(SW.load_completed_keys(SW.CSV_PATH))
+# Total configs is a cheap product of the swept-axis lengths — no CSV read. The
+# resume check (which scans the results CSV) is deferred to when a sweep is actually
+# launched below, so simply opening the page never touches a multi-GB results file.
+total_runs = prod(len(v) for v in SW.SWEEP_GRID.values())
 est_total_min = total_runs * SW.SECS_PER_RUN / 60
-est_remain_min = len(remaining) * SW.SECS_PER_RUN / 60
+resume_skip = st.checkbox(
+    "Skip already-completed configs (resume)", value=True,
+    help="When the sweep starts, read this config's results CSV and skip configs "
+         "whose full parameter key is already present, so a re-run continues where "
+         "it left off. Off = run and (re-)append every config in the grid. The check "
+         "runs **only when you press Run Sweep** — never on page load — so opening "
+         "the page stays fast even for multi-GB result files.")
 
 col_l, col_r = st.columns(2, gap="large")
 with col_l:
@@ -397,12 +416,12 @@ with col_r:
     st.subheader("Parameter Sweep")
     st.caption(
         f"Runs the full grid ({total_runs} configs × {len(SW.SWEEP_DETECTORS)} detectors), appending each "
-        f"config's rows to CSV. **Resumable** — completed configs are skipped."
+        f"config's rows to CSV. With **resume** on, completed configs are skipped "
+        f"when the sweep starts."
     )
-    ci1, ci2, ci3 = st.columns(3)
+    ci1, ci2 = st.columns(2)
     ci1.metric("Total configs", total_runs)
-    ci2.metric("Done (this config)", n_done)
-    ci3.metric("Remaining", len(remaining))
+    ci2.metric("Est. full sweep", f"{est_total_min:.0f} min")
     import os
     _max_workers = os.cpu_count() or 4
     run_parallel = st.checkbox(
@@ -420,9 +439,8 @@ with col_r:
              "The run auto-reduces workers on a crash rather than failing.",
     ) if run_parallel else 1
     run_sweep_btn = st.button(
-        "▶ Run Sweep" if remaining else "✓ Sweep complete for these fixed values",
-        type="primary", disabled=not remaining, width='stretch',
-        key="run_sweep_dst",
+        "▶ Run Sweep", type="primary", disabled=total_runs == 0,
+        width='stretch', key="run_sweep_dst",
     )
 
 st.markdown(
@@ -435,16 +453,33 @@ grid_res=`{grid_res}`, extract_q=`{extract_q}`, selection rule=`{sel_mode}`
 (`seed` is now swept). The sidebar `seed` still controls the **single run**.
 
 **Estimated time** (~{SW.SECS_PER_RUN:.0f} s/config): full sweep ≈ **{est_total_min:.0f} min**
-· remaining ≈ **{est_remain_min:.0f} min**.  **CSV:** `{SW.CSV_PATH}` ·
-rows completed across all fixed-value sets: **{done_total}**.
+(with resume on, only the not-yet-done configs actually run). **CSV:** `{SW.CSV_PATH}`.
 """
 )
-if run_parallel and n_workers > 1 and remaining:
+if run_parallel and n_workers > 1:
     st.caption(
-        f"⚡ With **{n_workers} workers**, the remaining ≈ {est_remain_min:.0f} min "
-        f"should drop to roughly **{est_remain_min / n_workers:.0f} min** "
+        f"⚡ With **{n_workers} workers**, the ≈ {est_total_min:.0f} min full sweep "
+        f"should drop to roughly **{est_total_min / n_workers:.0f} min** "
         f"(near-linear speed-up, minus pool overhead)."
     )
+
+# The completed-check runs here — only when the user actually launches the sweep,
+# never on page render. With resume on we scan the results CSV once and skip
+# already-done configs; off = run the whole grid.
+remaining = None
+if run_sweep_btn:
+    if resume_skip:
+        _csv_mtime = SW.CSV_PATH.stat().st_mtime if SW.CSV_PATH.exists() else 0.0
+        done_keys = _completed_keys(str(SW.CSV_PATH), _csv_mtime)
+        remaining = [full for full in ({**c, **fixed_params} for c in SW.parameter_grid())
+                     if SW.make_param_key(full) not in done_keys]
+    else:
+        remaining = [{**c, **fixed_params} for c in SW.parameter_grid()]
+    if not remaining:
+        st.success(
+            f"✓ All {total_runs} configs for these settings are already in "
+            f"`{SW.CSV_PATH.name}` — nothing to run. Uncheck **resume** above to "
+            f"re-run them from scratch.")
 
 if run_sweep_btn and remaining:
     n_total = len(remaining)
@@ -512,14 +547,6 @@ if run_sweep_btn and remaining:
         f"Rows appended to `{SW.CSV_PATH}`. Open "
         f"**Data-Selective — Visualise Results** to explore."
     )
-
-if SW.CSV_PATH.exists():
-    with st.expander("Preview last 15 CSV rows"):
-        try:
-            st.dataframe(pd.read_csv(SW.CSV_PATH, low_memory=False).tail(15),
-                         width='stretch', hide_index=True)
-        except Exception as e:
-            st.warning(f"Could not read CSV: {e}")
 
 st.markdown("---")
 if "dst" not in st.session_state:

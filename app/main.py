@@ -42,7 +42,7 @@ with col3:
         "baseline. Single run or a resumable parameter sweep.\n\n"
         "**Steps:** Setup → Training → Evaluation → Weakspot ID → Data Selection "
         "→ Retraining → Re-Evaluation. Aggregate results in "
-        "**Data-Selective — Visualise Results**."
+        "**Data Selective Training — Visualise Results**."
     )
 
 with col4:

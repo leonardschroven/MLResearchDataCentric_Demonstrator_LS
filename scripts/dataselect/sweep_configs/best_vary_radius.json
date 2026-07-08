@@ -1,0 +1,27 @@
+{
+  "name": "best_vary_radius",
+  "description": "Best-spot isolate (warm-start). Fixed at sel_sigma 0.2, n_select 100, mix_ratio 0.5, Weakpoint distance, top-3 detectors; sweeps the induced weakspot gap size (radius, 0 = no gap) AND initial-training time iters_initial [10,20,50,100,200] (brackets the ~50 whole-area sweet spot). Maps how gap size and initial-model strength jointly decide where guided beats random over the whole area vs only in the gap. 10 radius x 5 iters_initial x 3 seeds = 150 configs.",
+  "secs_per_run": 1.8,
+  "detectors": [
+    "RBF Interpolation",
+    "GPR/kNN (variance-weighted)",
+    "kNN Performance Mapping"
+  ],
+  "grid": {
+    "n_bumps":        [5],
+    "noise_std":      [0.05],
+    "n_pool_total":   [2000],
+    "shift_strength": [0.0],
+    "radius":         [0.0, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.18, 0.22, 0.26],
+    "iters_initial":  [10, 20, 50, 100, 200],
+    "n_train":        [800],
+    "sel_sigma":      [0.2],
+    "n_select":       [100],
+    "n_candidate":    [2000],
+    "sel_method":     ["Weakpoint distance"],
+    "mix_ratio":      [0.5],
+    "iters_retrain":  [200],
+    "warm_start":     [true],
+    "seed":           [42, 0, 7]
+  }
+}

@@ -1,0 +1,77 @@
+{
+  "name": "best_vary_detector",
+  "description": "Best-spot isolate (warm-start). Fixed at radius 0.12, sel_sigma 0.2, n_select 100, mix_ratio 0.5, Weakpoint distance; sweeps the weakspot-identification method — ALL 17 detectors run per config (one CSV row each) so they share the same initial model, gap and candidate pool for a clean head-to-head — across initial-training time iters_initial [10,20,50,100,200] (brackets the ~50 whole-area sweet spot). 5 iters_initial x 3 seeds x 17 detectors = 255 rows (15 configs).",
+  "secs_per_run": 6.5,
+  "detectors": [
+    "Gaussian Process Regression",
+    "Polynomial Response Surface",
+    "RBF Interpolation",
+    "kNN Performance Mapping",
+    "LOESS Local Regression",
+    "Quantile Regression",
+    "Peaks over Threshold (EVT)",
+    "Bayesian Optimization (EI)",
+    "kNN + GPR (mean)",
+    "kNN + Quantile (mean)",
+    "Anchored GPR (QR prior)",
+    "Gated GPR (QR anchor)",
+    "QR × GPR (geometric)",
+    "EVT × GPR (geometric)",
+    "GPR/kNN (variance-weighted)",
+    "GPR/kNN (disagreement-amplified)",
+    "Local GPR (QR-localised)"
+  ],
+  "grid": {
+    "n_bumps": [
+      5
+    ],
+    "noise_std": [
+      0.05
+    ],
+    "n_pool_total": [
+      2000
+    ],
+    "shift_strength": [
+      0.0
+    ],
+    "radius": [
+      0.12
+    ],
+    "iters_initial": [
+      10,
+      20,
+      50,
+      100,
+      200
+    ],
+    "n_train": [
+      800
+    ],
+    "sel_sigma": [
+      0.2
+    ],
+    "n_select": [
+      100
+    ],
+    "n_candidate": [
+      2000
+    ],
+    "sel_method": [
+      "Weakpoint distance"
+    ],
+    "mix_ratio": [
+      0.5
+    ],
+    "iters_retrain": [
+      200
+    ],
+    "warm_start": [
+      true
+    ],
+    "seed": [
+      42,
+      0,
+      7
+    ]
+  }
+}

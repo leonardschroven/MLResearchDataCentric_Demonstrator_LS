@@ -1,0 +1,27 @@
+{
+  "name": "prescan_warm",
+  "description": "Quick WARM pre-scan centered on the whole-area sweet spot (iters_initial~50, radius 0.12, warm-start). Coarsely co-varies initial-model strength (iters_initial x n_train), retrain budget (iters_retrain), and the selection axes (sel_sigma, n_select, mix_ratio) to find which OTHER parameters/ranges move the whole-area guided-vs-random win now that the anchor moved. 3 iters_initial x 3 n_train x 2 sel_sigma x 2 n_select x 2 mix x 2 iters_retrain x 2 seeds = 288 configs, top-3 detectors.",
+  "secs_per_run": 1.8,
+  "detectors": [
+    "RBF Interpolation",
+    "GPR/kNN (variance-weighted)",
+    "kNN Performance Mapping"
+  ],
+  "grid": {
+    "n_bumps":        [5],
+    "noise_std":      [0.05],
+    "n_pool_total":   [2000],
+    "shift_strength": [0.0],
+    "radius":         [0.12],
+    "iters_initial":  [20, 50, 100],
+    "n_train":        [200, 400, 800],
+    "sel_sigma":      [0.1, 0.3],
+    "n_select":       [50, 300],
+    "n_candidate":    [2000],
+    "sel_method":     ["Weakpoint distance"],
+    "mix_ratio":      [0.4, 0.75],
+    "iters_retrain":  [100, 400],
+    "warm_start":     [true],
+    "seed":           [42, 0]
+  }
+}

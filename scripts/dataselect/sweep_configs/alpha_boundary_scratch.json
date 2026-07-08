@@ -1,0 +1,28 @@
+{
+  "name": "alpha_boundary_scratch",
+  "description": "FROM-SCRATCH baseline (frozen, ~2.16M rows already collected). The broad AWS sweep that predates the warm-start default — every retrain here trained a brand-new model on the new points only (no warm-start), which is why guided/baseline regress vs the initial model. Kept as the from-scratch reference; do NOT re-run into this file (re-runs would now warm-start). Probes the rehearsal-mix alpha x gap-size (radius) boundary with the initial-training, selection and retraining axes, top-5 detectors. ~432,000 configs (~4-5 h on 60 vCores).",
+  "secs_per_run": 2.1,
+  "detectors": [
+    "EVT × GPR (geometric)",
+    "kNN Performance Mapping",
+    "Peaks over Threshold (EVT)",
+    "GPR/kNN (variance-weighted)",
+    "RBF Interpolation"
+  ],
+  "grid": {
+    "n_bumps":        [3, 5],
+    "noise_std":      [0.0, 0.05, 0.1],
+    "n_pool_total":   [2000],
+    "shift_strength": [0.0],
+    "radius":         [0.0, 0.08, 0.12, 0.18],
+    "iters_initial":  [25, 50, 100, 200],
+    "n_train":        [200, 400, 800, 1500, 2500],
+    "sel_sigma":      [0.05, 0.1, 0.2, 0.3, 0.5],
+    "n_select":       [50, 100, 300, 500, 700],
+    "n_candidate":    [2000],
+    "sel_method":     ["Weakpoint distance", "Weight by landscape", "Shape aware"],
+    "mix_ratio":      [1.0, 0.75, 0.5],
+    "iters_retrain":  [100, 200, 300, 400],
+    "seed":           [42]
+  }
+}
