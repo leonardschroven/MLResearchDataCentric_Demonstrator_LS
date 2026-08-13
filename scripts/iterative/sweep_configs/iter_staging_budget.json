@@ -1,0 +1,41 @@
+{
+  "name": "iter_staging_budget",
+  "description": "Is a fixed data budget better spent in ONE round or spread over MANY? Sweeps the trajectory length against the per-round budget along the constant-product diagonal (1x800, 2x400, 4x200, 8x100, 16x50), so every cell adds the same 800 curated points in total and only the STAGING differs. Each run also computes the budget- and compute-matched single-shot control (ss_guided_mae / ss_random_mae), giving a within-run reference as well as the across-cell comparison. This is the question the single-round study defined out of existence. Accumulative regime, one detector, 10 seeds.",
+  "secs_per_run": 8.0,
+  "detectors": [
+    "Quantile Regression"
+  ],
+  "grid": {
+    "n_iterations": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "n_select": [
+      50,
+      100,
+      200,
+      400,
+      800
+    ],
+    "regimes": [
+      [
+        "accumulative"
+      ]
+    ],
+    "seed": [
+      42,
+      0,
+      7,
+      1,
+      3,
+      5,
+      11,
+      17,
+      23,
+      99
+    ]
+  }
+}

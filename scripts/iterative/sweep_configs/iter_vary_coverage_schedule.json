@@ -1,0 +1,46 @@
+{
+  "name": "iter_vary_coverage_schedule",
+  "description": "The companion paper's named future work, made concrete: 'iterating the loop with a schedule that relaxes focus as the weak region shrinks ... expressible through either coverage control'. Sweeps the rehearsal-mix schedule (constant / linear / exponential decay / increase / adaptive-to-severity) against the starting mix, at the operating point. The adaptive schedule reads the weakspot's severity from the model's own error distribution — mean error inside the detected region over mean error outside — so it never touches ground truth and stays implementable on a fixed dataset. Accumulative regime, 8 iterations, one detector, 10 seeds.",
+  "secs_per_run": 4.0,
+  "detectors": [
+    "Quantile Regression"
+  ],
+  "grid": {
+    "mix_schedule": [
+      "Constant",
+      "Linear decay",
+      "Exponential decay",
+      "Linear increase",
+      "Adaptive (weakspot severity)"
+    ],
+    "mix_ratio": [
+      0.25,
+      0.5,
+      0.75,
+      1.0
+    ],
+    "mix_rate": [
+      0.5
+    ],
+    "n_iterations": [
+      8
+    ],
+    "regimes": [
+      [
+        "accumulative"
+      ]
+    ],
+    "seed": [
+      42,
+      0,
+      7,
+      1,
+      3,
+      5,
+      11,
+      17,
+      23,
+      99
+    ]
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "name": "iter_vary_lr_schedule",
+  "description": "2D: per-iteration LEARNING-RATE SCHEDULE x base learning rate. In a loop the learning rate decides how far each round is allowed to move the weights, which is the optimiser-side control of the same focus-vs-forgetting tension the paper found dominant on the data side. A decaying rate should let the early rounds absorb the weak region and the late rounds consolidate; a constant rate should keep drifting. Accumulative regime, 8 iterations, one detector, 10 seeds.",
+  "secs_per_run": 4.0,
+  "detectors": [
+    "Quantile Regression"
+  ],
+  "grid": {
+    "lr_schedule": [
+      "Constant",
+      "Exponential decay",
+      "Step decay",
+      "Cosine anneal",
+      "Warm restarts (SGDR)",
+      "Inverse-time decay"
+    ],
+    "lr_init": [
+      0.0003,
+      0.001,
+      0.003,
+      0.01
+    ],
+    "n_iterations": [
+      8
+    ],
+    "regimes": [
+      [
+        "accumulative"
+      ]
+    ],
+    "seed": [
+      42,
+      0,
+      7,
+      1,
+      3,
+      5,
+      11,
+      17,
+      23,
+      99
+    ]
+  }
+}

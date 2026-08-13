@@ -1,0 +1,43 @@
+{
+  "name": "iter_pool_and_target",
+  "description": "Two loop-only ablations crossed. (1) POOL MODE: a fresh candidate pool every round (the paper's protocol) versus a single fixed pool consumed without replacement — the latter is the fixed-dataset industrial setting the study is motivated by, where guidance eventually exhausts the good candidates. (2) DETECT MODE: re-identify the weakspot against the current model each round versus pinning the first detection — separating the value of *tracking* a migrating weakness from the value of aiming at it once. Also sweeps the initial-training time, since the paper's cold-start finding (intervene while undertrained) may not survive repetition. Accumulative regime, 8 iterations, one detector, 10 seeds.",
+  "secs_per_run": 4.0,
+  "detectors": [
+    "Quantile Regression"
+  ],
+  "grid": {
+    "pool_mode": [
+      "Fresh pool each iteration",
+      "Fixed pool (consumed)"
+    ],
+    "detect_mode": [
+      "Re-detect each iteration",
+      "Detect once (pinned target)"
+    ],
+    "iters_initial": [
+      12,
+      50,
+      200
+    ],
+    "n_iterations": [
+      8
+    ],
+    "regimes": [
+      [
+        "accumulative"
+      ]
+    ],
+    "seed": [
+      42,
+      0,
+      7,
+      1,
+      3,
+      5,
+      11,
+      17,
+      23,
+      99
+    ]
+  }
+}

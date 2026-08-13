@@ -16,7 +16,7 @@ Welcome to the PhD ML Research Lab. Use the sidebar to navigate between experime
 ### Available Experiments
 """)
 
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 
 with col1:
     st.markdown("### 🔍 Weakspot Identification Experiment")
@@ -48,9 +48,22 @@ with col3:
 with col4:
     st.markdown("### 🔁 Iterative Data-Selective Training")
     st.info(
-        "Loop the pipeline over several rounds — detect → select → retrain — "
-        "with a random baseline in parallel. Visualise the MAE progress per "
-        "iteration and the pool/selection at each step."
+        "The follow-up study: run the loop **many** rounds — detect → select → "
+        "continue training — with a random baseline advancing in parallel from "
+        "the same candidate pool.\n\n"
+        "**Adds:** per-iteration schedules for the learning rate and for the two "
+        "coverage controls (rehearsal mix α, kernel width σ), MLP architecture "
+        "variants, accumulative vs new-only vs size-matched regimes, and a "
+        "budget-matched single-shot control. Single run or a resumable sweep."
+    )
+
+with col5:
+    st.markdown("### 📈 Iterative — Visualise Results")
+    st.info(
+        "Aggregated **trajectories** from the iterative sweep: learning curves "
+        "with confidence bands, the guided-vs-random advantage per iteration, "
+        "forgetting outside the weakspot, and the effect of architecture, "
+        "learning-rate schedule, coverage schedules and staging."
     )
 
 st.markdown("---")

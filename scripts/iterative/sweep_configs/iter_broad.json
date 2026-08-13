@@ -1,0 +1,58 @@
+{
+  "name": "iter_broad",
+  "description": "The broad screening sweep for the iterative study, the analogue of the companion paper's 324,000-configuration grid but restricted to the axes the loop makes newly meaningful. Crosses trajectory length, the two coverage controls and their schedules, the learning-rate schedule, the architecture and the retraining budget, at the paper's operating point for everything else. Intended as the sensitivity map that fixes the iterative operating point before the single-axis configs isolate each dimension. Accumulative regime only and 3 seeds to keep it affordable — 2x3x3x2x3x3x3x3 = 2,916 configs x 3 seeds; run it on a many-core machine with the parallel option on.",
+  "secs_per_run": 4.0,
+  "detectors": [
+    "Quantile Regression"
+  ],
+  "grid": {
+    "n_iterations": [
+      4,
+      8
+    ],
+    "mix_ratio": [
+      0.25,
+      0.5,
+      0.75
+    ],
+    "mix_schedule": [
+      "Constant",
+      "Linear decay",
+      "Adaptive (weakspot severity)"
+    ],
+    "sel_sigma": [
+      0.2,
+      0.5
+    ],
+    "sigma_schedule": [
+      "Constant",
+      "Linear widen",
+      "Adaptive (weakspot severity)"
+    ],
+    "lr_schedule": [
+      "Constant",
+      "Exponential decay",
+      "Cosine anneal"
+    ],
+    "arch": [
+      "Complexity-scaled (2 × h)",
+      "Standard (2 × 64)",
+      "Deep (4 × 64)"
+    ],
+    "iters_retrain": [
+      100,
+      200,
+      400
+    ],
+    "regimes": [
+      [
+        "accumulative"
+      ]
+    ],
+    "seed": [
+      42,
+      0,
+      7
+    ]
+  }
+}

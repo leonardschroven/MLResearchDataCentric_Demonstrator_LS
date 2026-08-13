@@ -1,0 +1,41 @@
+{
+  "name": "iter_vary_architecture",
+  "description": "Single-axis: MODEL ARCHITECTURE. Everything else at the paper's operating point, accumulative regime only, 8 iterations, 10 seeds, one detector so the architecture is the only thing moving. The single-round study held one MLP shape fixed; under repetition capacity decides how much of the old input space a round of continued training can preserve while absorbing the weak region, so this maps the guided-vs-random gap and the out-of-weakspot drift against width, depth and a bottleneck. n_model_params is recorded on every row as the capacity covariate.",
+  "secs_per_run": 4.0,
+  "detectors": [
+    "Quantile Regression"
+  ],
+  "grid": {
+    "arch": [
+      "Tiny (1 × 16)",
+      "Small (1 × 64)",
+      "Complexity-scaled (2 × h)",
+      "Standard (2 × 64)",
+      "Wide (2 × 256)",
+      "Deep (4 × 64)",
+      "Deep narrow (6 × 32)",
+      "Pyramid (128-64-32)",
+      "Bottleneck (128-16-128)"
+    ],
+    "n_iterations": [
+      8
+    ],
+    "regimes": [
+      [
+        "accumulative"
+      ]
+    ],
+    "seed": [
+      42,
+      0,
+      7,
+      1,
+      3,
+      5,
+      11,
+      17,
+      23,
+      99
+    ]
+  }
+}

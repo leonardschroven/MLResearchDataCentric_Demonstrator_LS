@@ -1,526 +1,770 @@
-"""
-Iterative Data-Selective Training.
+"""Iterative Data-Selective Training.
 
-Same pipeline as the single-round page, but run as a loop: each iteration
-evaluates the model, detects a fresh weakspot with the chosen detector, selects
-new data around it, adds it to the (accumulating) training set, and retrains.
-A random-selection baseline is trained in parallel under identical conditions,
-so their performance can be compared iteration by iteration.
+The follow-up experiment to the companion paper *Data-Selective Machine Learning
+Training Based on Statistical Weakspot Identification*, which analysed a single
+round of
 
-The Visualisation tab shows it all in one place: the MAE-per-iteration curves
-(guided vs random), and — for any chosen iteration — the candidate pool with the
-guided and random selections overlaid.
+    evaluate → identify weakspot → select data → retrain
+
+deliberately, "in order to isolate the effect of one targeted selection from the
+confounding effects of iteration", and closed by naming the loop as its own
+future work. This page runs that loop: each round re-evaluates the model,
+detects its *current* weakspot, selects new data around it and continues
+training, with a matched random-selection baseline trained in parallel under
+identical conditions and from the same candidate pool.
+
+Everything the loop makes newly meaningful is exposed as an axis:
+
+* **Architecture and optimiser** — the single-round study held one MLP shape
+  fixed. Under repetition, capacity and learning rate govern how much of the old
+  input space survives each round of continued training.
+* **Per-iteration schedules** for the learning rate and for the paper's two
+  dominant coverage controls (rehearsal mix α, kernel width σ), including an
+  adaptive variant that relaxes the focus as the detected weakspot heals — the
+  extension the paper's Discussion names explicitly.
+* **Regimes** — accumulative (the industrial protocol the paper listed as
+  untested), new-only (the paper's own conservative protocol, repeated), and a
+  size-matched scaled-accum control.
+* **Staging** — a budget- and compute-matched single-shot reference answering
+  whether K rounds of n points beat one round of K·n.
+
+The heavy lifting lives in ``scripts.iterative`` so this page, the parameter
+sweep and its parallel workers all run the same code. The single-round pages
+(07/08) and the weakspot pages (05/06) are untouched.
 """
 from __future__ import annotations
 
-import copy
+import os
 import sys
+import time
+from math import prod
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
-from scripts.weakspot.models import AVAILABLE_MODELS, build_model
-from scripts.weakspot.detection import DETECTION_METHODS, create_grid
-from scripts.weakspot.extraction import extract_weakspot, induced_mask
-from scripts.weakspot.plotting import plot_ground_truth_error
 from scripts.dataselect import pipeline as P
-from scripts.dataselect.plots import plot_selection, plot_landscape
+from scripts.dataselect.plots import plot_landscape, plot_selection, plot_training_points
+from scripts.iterative import loop as L
+from scripts.iterative import models as M
+from scripts.iterative import plots as IP
+from scripts.iterative import sweep as SW
+from scripts.weakspot.detection import DETECTION_METHODS
+from scripts.weakspot.models import AVAILABLE_MODELS
+from scripts.weakspot.plotting import plot_data_overview, plot_ground_truth_error
 
 st.set_page_config(page_title="Iterative Data-Selective Training", layout="wide")
 st.title("🔁 Iterative Data-Selective Training")
 st.markdown(
-    "Loop the pipeline: **detect → select → retrain**, each round finding the "
-    "model's *current* weakspot, adding data there, and retraining — with a random "
-    "baseline trained in parallel for comparison."
+    "Loop the pipeline — **detect → select → continue training** — each round "
+    "finding the model's *current* weakspot, adding data there and training on, "
+    "with a random baseline advancing in parallel from the same candidate pool."
 )
 st.caption(
-    "The sidebar defaults are preset (from the page-07/08 sweep + a seed-robustness "
-    "replay of this loop) to showcase a **consistent** guided advantage. The single "
-    "metric to watch is the **error inside the weakspot** (second chart): a random "
-    "baseline that scatters points uniformly rarely lands enough of them in the gap, "
-    "so guided sits roughly **2–3× below random there in the early iterations** and "
-    "stays below on the across-iteration average for every seed tested. Ingredients: "
-    "a **large, clear** induced gap (radius 0.22) so filling it also moves the global "
-    "metric; a **deliberately under-trained** initial model (50 iters) for headroom; a "
-    "**focused** selection kernel (σ=0.15, 100 pts/iter) so guided concentrates in the "
-    "gap while random misses it; and retraining time (200 iters) **≥** the initial "
-    "budget so retrained models are never under-trained. The **overall MAE** curve is "
-    "close to a tie — once enough data accumulates both models approach the noise "
-    "floor globally — so guided's win is genuine but **local**; that is the honest, "
-    "defensible claim. Caveats that flip the result: a *smaller* gap (random hits it "
-    "by chance), *more* iterations (random eventually fills the gap too — keep it "
-    "≈6–8), a *wider* σ or *larger* n_select (guided spreads out and stops being "
-    "distinguishable from random), or raising the initial training time without "
-    "raising retraining time to match."
+    "Defaults are the companion paper's operating point (5 bumps, label noise "
+    "0.05, gap radius 0.25, an undertrained initial model of 12 iterations on 100 "
+    "points, kernel σ=0.5, rehearsal mix α=0.5, 100 points added per round, 400 "
+    "retraining iterations, warm-start), now run **eight times over** instead of "
+    "once. Every axis this study adds starts at its neutral setting, so an "
+    "out-of-the-box run is exactly the paper's configuration looped — switch one "
+    "schedule, architecture or regime on at a time and the change is attributable."
 )
 
 # ─────────────────────────────────────────────────────────────
-# SIDEBAR
+# PRESETS — starting points, each a complete config
 # ─────────────────────────────────────────────────────────────
+PRESETS: dict[str, dict] = {
+    "Paper operating point (looped)": {},
+    "Paper broad-sweep best (small gap 0.12)": dict(radius=0.12),
+    "Forgetting stress test (narrow σ, pure guided)": dict(
+        sel_sigma=0.1, mix_ratio=1.0, regimes=list(L.REGIMES)),
+    "Relax-the-focus schedule (adaptive α)": dict(
+        mix_schedule="Adaptive (weakspot severity)", mix_ratio=1.0, sel_sigma=0.2),
+    "Consolidating learning rate (cosine decay)": dict(
+        lr_schedule="Cosine anneal", iters_retrain=200),
+    "Fixed dataset (pool consumed)": dict(
+        pool_mode=L.POOL_MODES[1], n_candidate=1200, n_iterations=8),
+    "Legacy page-09 showcase": dict(
+        n_bumps=5, noise_std=0.05, radius=0.22, iters_initial=50, n_train=800,
+        sel_sigma=0.15, mix_ratio=1.0, n_select=100, iters_retrain=200,
+        n_iterations=8, detector="EVT × GPR (geometric)", n_pool_total=2000),
+}
+
+# Every sidebar widget is keyed and its value seeded here, so a preset can rewrite
+# the whole sidebar in one go. Because the keys already exist in session state the
+# widgets below deliberately take **no** ``value``/``index``/``default`` argument —
+# passing one alongside a pre-seeded key is what Streamlit warns about.
+S = st.session_state
+for _k, _v in L.DEFAULTS.items():
+    S.setdefault(f"it_{_k}", _v)
+S.setdefault("it_induce", L.DEFAULTS["radius"] > 0)
+S.setdefault("it_training_mode", "Warm-start (transfer)")
+
 st.sidebar.header("⚙️ Pipeline Setup")
-seed = st.sidebar.number_input("Random seed", 0, 9999, 42, 1)
+_preset = st.sidebar.selectbox(
+    "Preset", list(PRESETS), key="it_preset",
+    help="A complete starting configuration. **Paper operating point** reproduces "
+         "the companion study's best single-round setting, looped. The others each "
+         "isolate one question this study adds. Pressing *Apply* overwrites every "
+         "sidebar value, so a preset is always a clean starting point.")
+if st.sidebar.button("↺ Apply preset", width='stretch'):
+    _full = L.default_config(**PRESETS[_preset])
+    for _k, _v in _full.items():
+        S[f"it_{_k}"] = _v
+    # Two widgets present a config field in a different form; keep them in step.
+    S["it_induce"] = _full["radius"] > 0
+    S["it_training_mode"] = ("Warm-start (transfer)" if _full["warm_start"]
+                             else "From scratch (retrain)")
+    st.rerun()
 
-st.sidebar.subheader("1. Dataset & Landscape")
-n_bumps = st.sidebar.slider("Function complexity (n_bumps)", 1, 10, 5, 1)
-noise_std = st.sidebar.slider("Label noise σ (training only)", 0.0, 0.5, 0.05, 0.01)
-n_pool_total = st.sidebar.slider("Initial dataset size", 500, 4000, 2000, 100)
+sb = st.sidebar
+seed = sb.number_input("Random seed", 0, 9999, step=1, key="it_seed")
 
-st.sidebar.subheader("2. Distribution Shift")
-shift_strength = st.sidebar.slider("Shift strength", 0.0, 1.0, 0.0, 0.05)
-scx = st.sidebar.slider("Shift centre x₁", 0.0, 1.0, 0.30, 0.05, disabled=(shift_strength == 0.0))
-scy = st.sidebar.slider("Shift centre x₂", 0.0, 1.0, 0.30, 0.05, disabled=(shift_strength == 0.0))
-shift_spread = st.sidebar.slider("Shift spread σ", 0.05, 0.40, 0.15, 0.01, disabled=(shift_strength == 0.0))
+sb.subheader("1. Dataset & Landscape")
+n_bumps = sb.slider("Function complexity (n_bumps)", 1, 10, step=1, key="it_n_bumps")
+noise_std = sb.slider("Label noise σ (training only)", 0.0, 0.5, step=0.01,
+                      key="it_noise_std")
+n_pool_total = sb.slider("Initial dataset size", 500, 4000, step=100,
+                         key="it_n_pool_total")
 
-st.sidebar.subheader("3. Induced Weakspot")
-induce_ws = st.sidebar.checkbox("Induce a weakspot (leave out a data gap)", value=True)
-center_x = st.sidebar.slider("Weakspot centre x₁", 0.1, 0.9, 0.5, 0.01, disabled=not induce_ws)
-center_y = st.sidebar.slider("Weakspot centre x₂", 0.1, 0.9, 0.5, 0.01, disabled=not induce_ws)
-radius = st.sidebar.slider("Exclusion radius", 0.02, 0.30, 0.22, 0.01, disabled=not induce_ws)
+sb.subheader("2. Distribution Shift")
+shift_strength = sb.slider("Shift strength", 0.0, 1.0, step=0.05,
+                           key="it_shift_strength")
+_no_shift = shift_strength == 0.0
+scx = sb.slider("Shift centre x₁", 0.0, 1.0, step=0.05,
+                disabled=_no_shift, key="it_shift_center_x")
+scy = sb.slider("Shift centre x₂", 0.0, 1.0, step=0.05,
+                disabled=_no_shift, key="it_shift_center_y")
+shift_spread = sb.slider("Shift spread σ", 0.05, 0.40, step=0.01,
+                         disabled=_no_shift, key="it_shift_spread")
 
-st.sidebar.subheader("4. Model & Initial Training")
-_mk = list(AVAILABLE_MODELS.keys())
-model_name = st.sidebar.selectbox("Algorithm", _mk,
-                                  index=_mk.index("MLP Neural Network") if "MLP Neural Network" in _mk else 0)
-complexity = st.sidebar.slider("Model complexity", 0.0, 1.0, 0.5, 0.05)
-iters_initial = st.sidebar.slider(
-    "Initial training time (iterations)", 20, 2000, 50, 10,
-    help="Kept deliberately low so the initial model is under-trained (large MAE) "
-         "and there is clear headroom for the iterations to improve on. Make sure "
-         "retraining time (§8) is ≥ this value, otherwise every retrained model is "
-         "under-trained relative to iteration 0 and MAE rises instead of falling.")
-n_train = st.sidebar.slider("Initial training points", 100, 3000, 800, 50)
+sb.subheader("3. Induced Weakspot")
+induce_ws = sb.checkbox("Induce a weakspot (leave out a data gap)", key="it_induce")
+center_x = sb.slider("Weakspot centre x₁", 0.1, 0.9, step=0.01,
+                     disabled=not induce_ws, key="it_center_x")
+center_y = sb.slider("Weakspot centre x₂", 0.1, 0.9, step=0.01,
+                     disabled=not induce_ws, key="it_center_y")
+radius = sb.slider(
+    "Exclusion radius", 0.0, 0.40, step=0.01, disabled=not induce_ws,
+    key="it_radius",
+    help="0.25 is the enlarged gap the paper's isolation experiments used, so a "
+         "local repair is big enough to move the whole-area metric; 0.12 was its "
+         "broad-sweep best. With a small gap the random baseline hits it by chance "
+         "and the guided advantage collapses.")
 
-st.sidebar.subheader("5. Evaluation")
-n_eval = st.sidebar.slider("Evaluation points on landscape", 200, 3000, 1000, 100)
+sb.subheader("4. Model & Architecture")
+model_name = sb.selectbox("Algorithm", list(AVAILABLE_MODELS), key="it_model_name")
+_is_mlp = AVAILABLE_MODELS[model_name] == "mlp"
+arch = sb.selectbox(
+    "MLP architecture", list(M.ARCHITECTURES), key="it_arch",
+    disabled=not _is_mlp,
+    help="Hidden-layer shape. **Complexity-scaled (2 × h)** reproduces the "
+         "companion paper's model exactly (h = complexity × 128). The loop makes "
+         "this a real axis: capacity decides how much of the already-learnt input "
+         "space a round of continued training on the weak region can preserve.")
+complexity = sb.slider("Model complexity", 0.0, 1.0, step=0.05,
+                       key="it_complexity",
+                       help="Capacity for the non-MLP algorithms, and the width h "
+                            "of the complexity-scaled MLP architecture.")
+activation = sb.selectbox("Activation", list(M.ACTIVATIONS),
+                          key="it_activation", disabled=not _is_mlp)
+solver = sb.selectbox("Solver", list(M.SOLVERS), key="it_solver",
+                      disabled=not _is_mlp,
+                      help="`adam` adapts its own step sizes; `sgd` follows the "
+                           "learning rate literally, so the schedule below bites "
+                           "harder.")
+alpha_l2 = sb.select_slider(
+    "L2 penalty α", [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1],
+    key="it_alpha", disabled=not _is_mlp,
+    help="Weight decay. A stronger penalty resists the per-round drift towards the "
+         "weak region — the optimiser-side counterpart of uniform rehearsal.")
+batch_size = sb.number_input(
+    "Batch size (0 = auto)", 0, 2048, step=16, key="it_batch_size",
+    disabled=not _is_mlp,
+    help="0 uses sklearn's default (min(200, n)). Small batches take more, noisier "
+         "steps per round on the same data.")
+lr_init = sb.select_slider(
+    "Base learning rate", [1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2],
+    key="it_lr_init", disabled=not _is_mlp,
+    help="Starting rate, and the value the schedule in §8 decays from. 1e-3 is "
+         "sklearn's default and what the companion paper used implicitly.")
 
-st.sidebar.subheader("6. Weakspot Identification")
-_dm = list(DETECTION_METHODS.keys())
-detect_name = st.sidebar.selectbox(
-    "Detection method (single)", _dm,
-    index=_dm.index("EVT × GPR (geometric)") if "EVT × GPR (geometric)" in _dm else 0)
-grid_res = st.sidebar.slider("Grid resolution", 20, 60, 35, 5)
-extract_q = st.sidebar.slider("Extraction threshold quantile", 0.50, 0.99, 0.85, 0.01)
+sb.subheader("5. Initial Training")
+iters_initial = sb.slider(
+    "Initial training time (iterations)", 3, 2000, step=1,
+    key="it_iters_initial",
+    help="Kept deliberately low (12 at the paper's operating point) so the initial "
+         "model is undertrained and there is headroom for the loop. The paper found "
+         "headroom mattered more than the reliability of the diagnosis — whether "
+         "that survives repetition is one of this study's questions.")
+n_train = sb.slider("Initial training points", 50, 3000, step=10, key="it_n_train")
 
-st.sidebar.subheader("7. Data Selection (per iteration)")
-sel_method = st.sidebar.selectbox(
-    "Selection method", list(P.SEL_METHODS), index=0,
-    help="How each iteration weights new points around the current weakness:\n\n"
-         "• **Weakpoint distance** — isotropic Gaussian around the single detected "
-         "centre (the original strategy).\n"
-         "• **Weight by landscape** — sample ∝ the whole detected error surface, "
-         "covering *every* weak region (multi-modal, robust to a mis-located centre).\n"
-         "• **Shape aware** — Gaussian shaped to the detected weakspot ellipse "
-         "(anisotropic; σ below sets the overall width).")
-sel_mode = st.sidebar.radio("Selection rule", ["Sample ∝ weight", "Top-weighted"])
-sel_sigma = st.sidebar.slider("Selection Gaussian σ", 0.02, 0.80, 0.15, 0.01)
-n_select = st.sidebar.slider("Points added per iteration", 20, 1000, 100, 20)
-n_candidate = st.sidebar.slider("Candidate pool size", 200, 4000, 2000, 100)
+sb.subheader("6. Evaluation")
+n_eval = sb.slider("Evaluation points on landscape", 200, 3000, step=100,
+                   key="it_n_eval")
 
-st.sidebar.subheader("8. Retraining & Iterations")
-training_mode = st.sidebar.radio(
-    "Training mode", ["Warm-start (transfer)", "From scratch (retrain)"], index=0,
-    help="**Warm-start (transfer)** — each iteration *continues* training the same "
-         "model from the previous round's weights (transfer / fine-tuning), all tracks "
-         "branching from the shared initial model. Smoother, faster-improving curves "
-         "and the natural fit for iteratively added data. Implemented for the MLP; "
-         "other algorithms fall back to from-scratch.\n\n"
-         "**From scratch (retrain)** — each iteration rebuilds the model from zero on "
-         "that regime's data, with no memory of previous weights. Higher iteration-to-"
-         "iteration variance; information is retained only through the accumulated "
-         "*data*, not the weights.")
-early_stop = st.sidebar.checkbox(
-    "Early stopping (regularise MLP)", value=True,
-    help="MLP only. When on (default), training stops once a held-out validation "
-         "split (~10%% of each batch) stops improving — sklearn's early_stopping, a "
-         "regulariser against overfitting. Turn off to train the full epoch budget. "
-         "Applies to both the initial and every per-iteration fit. Especially helpful "
-         "with warm-start, where continual fine-tuning on concentrated data tends to "
-         "over-specialise and drift.")
-iters_retrain = st.sidebar.slider(
-    "Retraining time (iterations)", 20, 2000, 200, 10,
-    help="Epoch budget per iteration. **Warm-start:** epochs of *continued* training "
-         "added each round on top of the carried-over weights. **From scratch:** total "
-         "epochs the rebuilt model gets — keep it ≥ the initial training time (§4), "
-         "otherwise the retrained model is under-trained and iteration 1 looks worse "
-         "than iteration 0 even when the added data is good.")
-n_iterations = st.sidebar.slider("Number of iterations", 1, 20, 8, 1)
+sb.subheader("7. Weakspot Identification")
+detector = sb.selectbox(
+    "Detection method", list(DETECTION_METHODS), key="it_detector",
+    help="Quantile Regression was the strongest of all seventeen detectors at the "
+         "paper's operating point; every one of them beat the random baseline there, "
+         "so this axis is second-order — settle coverage first.")
+detect_mode = sb.radio(
+    "Target", list(L.DETECT_MODES), key="it_detect_mode",
+    help="**Re-detect each iteration** tracks the weakness as it migrates — the "
+         "point of looping. **Detect once** pins the first detection as a fixed "
+         "target, isolating how much of the benefit comes from *tracking* rather "
+         "than from aiming once.")
+grid_res = sb.slider("Grid resolution", 20, 60, step=5, key="it_grid_res")
+extract_q = sb.slider("Extraction threshold quantile", 0.50, 0.99, step=0.01,
+                      key="it_extract_q")
 
-st.sidebar.markdown("---")
-run_btn = st.sidebar.button("🚀 Run Iterative Pipeline", type="primary",
+sb.subheader("8. Data Selection")
+sel_method = sb.selectbox(
+    "Selection strategy", list(P.SEL_METHODS), key="it_sel_method",
+    help="• **Weakpoint distance** — isotropic Gaussian on the detected centre.\n"
+         "• **Weight by landscape** — sample ∝ the whole detected error surface "
+         "(multi-modal, robust to a mis-located centre).\n"
+         "• **Shape aware** — Gaussian shaped to the detected ellipse.")
+sel_mode = sb.radio("Selection rule", ["Sample ∝ weight", "Top-weighted"],
+                    key="it_sel_mode")
+sel_sigma = sb.slider(
+    "Kernel width σ (start)", 0.02, 1.50, step=0.01, key="it_sel_sigma",
+    help="One of the paper's two dominant controls. Narrow = pours data into the "
+         "gap and risks forgetting; above ~0.5 the kernel is nearly flat on the unit "
+         "square and guided selection approaches the random baseline.")
+sigma_schedule = sb.selectbox(
+    "σ schedule", list(M.SIGMA_SCHEDULES), key="it_sigma_schedule",
+    help="How σ changes per round. **Adaptive** widens the kernel as the detected "
+         "weakspot heals (severity measured from the model's own error surface, no "
+         "ground truth) — the kernel-side form of the paper's proposed 'relax the "
+         "focus as the weak region shrinks'.")
+sigma_rate = sb.slider("σ schedule rate", 0.0, 2.0, step=0.05,
+                       key="it_sigma_rate",
+                       disabled=(sigma_schedule == "Constant"),
+                       help="Total relative widening/narrowing reached at the final "
+                            "iteration (linear), or the per-round growth factor − 1 "
+                            "(exponential).")
+mix_ratio = sb.slider(
+    "Rehearsal mix α (start)", 0.0, 1.0, step=0.05, key="it_mix_ratio",
+    help="Fraction of each round's points drawn by the weakspot kernel; the rest are "
+         "uniform rehearsal. **The paper's master switch** — α=0 is the random "
+         "baseline by construction, and past a crossover near α≈0.4 under a narrow "
+         "kernel its single-round model forgot the rest of the space catastrophically.")
+mix_schedule = sb.selectbox("α schedule", list(M.MIX_SCHEDULES), key="it_mix_schedule")
+mix_rate = sb.slider("α schedule rate", 0.0, 1.0, step=0.05,
+                     key="it_mix_rate", disabled=(mix_schedule == "Constant"),
+                     help="Fraction of α given up by the final iteration (linear "
+                          "schedules) or the per-round multiplier (exponential).")
+n_select = sb.slider("Points added per iteration", 10, 1000, step=10, key="it_n_select")
+n_candidate = sb.slider("Candidate pool size", 200, 4000, step=100,
+                        key="it_n_candidate")
+pool_mode = sb.radio(
+    "Candidate pool", list(L.POOL_MODES), key="it_pool_mode",
+    help="**Fresh pool each iteration** is the paper's protocol. **Fixed pool** draws "
+         "one pool up front and consumes it without replacement — the fixed-dataset "
+         "industrial setting the study is motivated by, where guidance eventually "
+         "exhausts the candidates near the weakspot.")
+
+sb.subheader("9. Retraining & Loop")
+training_mode = sb.radio(
+    "Training mode", ["Warm-start (transfer)", "From scratch (retrain)"],
+    key="it_training_mode",
+    help="**Warm-start** continues each track's model from the previous round's "
+         "weights, which is what makes this a *continued* training study. MLP only; "
+         "other algorithms fall back to from-scratch.")
+early_stop = sb.checkbox("Early stopping (regularise MLP)", key="it_early_stopping")
+iters_retrain = sb.slider("Retraining time per iteration", 20, 2000, step=10,
+                          key="it_iters_retrain")
+n_iterations = sb.slider("Number of iterations", 1, 30, step=1, key="it_n_iterations")
+lr_schedule = sb.selectbox(
+    "Learning-rate schedule", list(M.LR_SCHEDULES),
+    key="it_lr_schedule", disabled=not _is_mlp,
+    help="One step per **loop iteration**, not per epoch: how far each round may "
+         "move the weights. Decay lets early rounds absorb the weak region and late "
+         "rounds consolidate — the optimiser-side counter to forgetting.")
+_lr_flat = lr_schedule == "Constant"
+lr_gamma = sb.slider("LR decay γ", 0.1, 1.0, step=0.05, key="it_lr_gamma",
+                     disabled=_lr_flat or not _is_mlp)
+lr_min = sb.select_slider("LR floor (cosine)", [1e-7, 1e-6, 1e-5, 1e-4, 1e-3],
+                          key="it_lr_min", disabled=_lr_flat or not _is_mlp)
+lr_step = sb.slider("LR step / restart period", 1, 10, step=1,
+                    key="it_lr_step", disabled=_lr_flat or not _is_mlp)
+regimes = sb.multiselect(
+    "Regimes to run", list(L.REGIMES), key="it_regimes",
+    help="**Accumulative** retrains on the whole growing set (always run — the "
+         "industrial protocol the paper left untested). **New-only** uses just that "
+         "round's points, repeating the paper's conservative protocol. "
+         "**Scaled-accum** subsamples the accumulated pool to the new-only point "
+         "count: if it tracks accumulative at equal size, the win is the training "
+         "*distribution*, not the amount of data.")
+single_shot = sb.checkbox(
+    "Budget-matched single-shot control", key="it_single_shot",
+    help="Also trains one model on K × n_select points added in a single round, with "
+         "K × the retraining budget — so data and compute match and only the staging "
+         "differs. Answers whether iterating is worth anything at all.")
+tie_model_seed = sb.checkbox("Tie weight init to the seed", key="it_tie_model_seed",
+                             help="Off (default, and what the paper did) fixes the "
+                                  "MLP initialisation at 42 so only the data varies "
+                                  "across seeds. On also varies the initialisation.")
+
+sb.markdown("---")
+run_btn = sb.button("🚀 Run Iterative Pipeline", type="primary", width='stretch')
+
+
+def _current_config() -> dict:
+    """The sidebar as an engine config."""
+    return L.default_config(
+        seed=int(seed), n_bumps=int(n_bumps), noise_std=float(noise_std),
+        n_pool_total=int(n_pool_total), shift_strength=float(shift_strength),
+        shift_center_x=float(scx), shift_center_y=float(scy),
+        shift_spread=float(shift_spread),
+        radius=float(radius) if induce_ws else 0.0,
+        center_x=float(center_x), center_y=float(center_y),
+        model_name=model_name, complexity=float(complexity), arch=arch,
+        activation=activation, solver=solver, alpha=float(alpha_l2),
+        batch_size=int(batch_size), lr_init=float(lr_init),
+        iters_initial=int(iters_initial), n_train=int(n_train), n_eval=int(n_eval),
+        grid_res=int(grid_res), extract_q=float(extract_q),
+        detector=detector, detect_mode=detect_mode,
+        sel_method=sel_method, sel_mode=sel_mode,
+        sel_sigma=float(sel_sigma), sigma_schedule=sigma_schedule,
+        sigma_rate=float(sigma_rate), mix_ratio=float(mix_ratio),
+        mix_schedule=mix_schedule, mix_rate=float(mix_rate),
+        n_select=int(n_select), n_candidate=int(n_candidate), pool_mode=pool_mode,
+        warm_start=training_mode.startswith("Warm"), early_stopping=bool(early_stop),
+        iters_retrain=int(iters_retrain), n_iterations=int(n_iterations),
+        lr_schedule=lr_schedule, lr_gamma=float(lr_gamma), lr_min=float(lr_min),
+        lr_step=int(lr_step), regimes=list(regimes) or ["accumulative"],
+        single_shot=bool(single_shot), tie_model_seed=bool(tie_model_seed),
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# RUN
+# ─────────────────────────────────────────────────────────────
+if run_btn or S.pop("_it_trigger", False):
+    cfg = _current_config()
+    if cfg["warm_start"] and AVAILABLE_MODELS[cfg["model_name"]] != "mlp":
+        st.info(f"Warm-start is implemented for the MLP; **{cfg['model_name']}** "
+                f"is rebuilt from scratch each iteration instead.")
+    bar = st.progress(0.0, text="Iterating…")
+    res = L.run_iterative(cfg, keep_rounds=True,
+                          progress=lambda d, t, txt: bar.progress(d / max(t, 1), text=txt))
+    bar.empty()
+    S["iter2"] = res
+
+if "iter2" not in S:
+    st.info("Configure the sidebar and press **🚀 Run Iterative Pipeline** — or open "
+            "the **🧪 Parameter Sweep** tab to run a whole grid.")
+
+R = S.get("iter2")
+
+tabs = st.tabs(["① Setup", "📉 Trajectory", "🔬 Round Explorer",
+                "🎛️ Schedules & Detection", "🧾 Summary", "🧪 Parameter Sweep"])
+
+# ─────────────────────────────────────────────────────────────
+# ① SETUP
+# ─────────────────────────────────────────────────────────────
+with tabs[0]:
+    if R is None:
+        st.info("Run the pipeline to populate this tab.")
+    else:
+        su, cfg = R["setup"], R["cfg"]
+        st.subheader("Setup — landscape, induced gap and initial training set")
+        st.caption(
+            "The target is a sum of Gaussian bumps on the unit square. A weakspot is "
+            "induced by withholding every training point inside the red circle; noise "
+            "is added to training and selected labels only, so the evaluation error "
+            "measures genuine model failure rather than label noise.")
+        c1, c2 = st.columns(2)
+        c1.plotly_chart(plot_landscape(su["xx"], su["yy"], su["true_grid"],
+                                       su["center"], su["radius"]), width='stretch')
+        c2.plotly_chart(plot_data_overview(
+            su["X_keep"], P.true_function(su["X_keep"], n_bumps=cfg["n_bumps"]),
+            su["X_excl"], su["center"], su["radius"], "x₁", "x₂", "f(x₁,x₂)",
+            excl_mode="Circle (radius)"), width='stretch')
+        st.plotly_chart(plot_training_points(
+            su["X_tr0"], su["y_tr0"], None, su["center"], su["radius"],
+            title="Initial training set (the gap is left empty)"), width='stretch')
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Initial training points", len(su["X_tr0"]))
+        m2.metric("Withheld by the gap", len(su["X_excl"]))
+        m3.metric("Model parameters", f"{su['n_params']:,}")
+        m4.metric("Training mode",
+                  "warm-start" if su["warm"] else "from scratch")
+
+# ─────────────────────────────────────────────────────────────
+# 📉 TRAJECTORY
+# ─────────────────────────────────────────────────────────────
+with tabs[1]:
+    if R is None:
+        st.info("Run the pipeline to populate this tab.")
+    else:
+        H, cfg = R["tracks"], R["cfg"]
+        iters = R["iters"]
+        st.subheader("Training progress across the loop")
+        st.caption(
+            "**Colour = strategy** (green guided, red random); **line style = regime** "
+            "(solid accumulative, dotted new-only, dashed scaled-accum). Iteration 0 is "
+            "the shared initial model. Lower is better. Guided and random draw from the "
+            "*same* candidate pool each round, so the only difference between a green "
+            "and a red curve is the selection rule.")
+        s1, s2 = st.columns([1.4, 1])
+        sm = s1.selectbox("Trend smoothing", list(IP.SMOOTHERS), index=0,
+                          help="Cosmetic only — raw values stay visible as faint dots, "
+                               "and the Summary table and CSV always use raw numbers.")
+        win = s2.slider("Smoothing window / span", 2, max(3, len(iters) - 1), 3,
+                        disabled=(sm == "None"))
+
+        refs = None
+        if R.get("single_shot"):
+            ss = R["single_shot"]
+            refs = {"single-shot guided": (ss["guided"]["mae"], "#2ca02c"),
+                    "single-shot random": (ss["random"]["mae"], "#d62728")}
+        st.plotly_chart(IP.trend_figure(
+            iters, H, "mae", "MAE",
+            "Whole-area evaluation MAE per iteration", sm, win, refs), width='stretch')
+        if refs:
+            st.caption(
+                "The dash-dot lines are the **budget- and compute-matched single-shot** "
+                "controls: the same K × n_select points added in one round with K × the "
+                "retraining budget. A trajectory that ends below its own control is "
+                "evidence that *staging* the budget — not merely spending it — is what "
+                "helps.")
+
+        if cfg["radius"] > 0:
+            st.markdown("---")
+            st.subheader("Local repair vs collateral damage")
+            st.caption(
+                "The two halves of the paper's central tension, measured directly. "
+                "**Left:** error inside the induced gap — what guidance is *for*. "
+                "**Right:** error everywhere else — what over-concentration costs. "
+                "The single-round study could only infer this trade-off from the "
+                "whole-area metric; here it is separated and tracked round by round.")
+            g1, g2 = st.columns(2)
+            g1.plotly_chart(IP.trend_figure(iters, H, "err_in", "error in weakspot",
+                                            "Inside the induced gap", sm, win),
+                            width='stretch')
+            g2.plotly_chart(IP.trend_figure(iters, H, "err_out", "error outside weakspot",
+                                            "Outside the gap (forgetting)", sm, win),
                             width='stretch')
 
+        st.markdown("---")
+        st.subheader("Head-to-head: guided − random, per iteration")
+        st.caption(
+            "The quantity the companion paper reported as a single number for one "
+            "round, now as a trajectory. Below zero = guided ahead. Whether an early "
+            "advantage survives to the end of the loop, or is competed away as the "
+            "random baseline accumulates coverage, is the question this chart answers.")
+        st.plotly_chart(IP.gap_figure(iters, H, "mae",
+                                      "Whole-area MAE advantage", sm, win),
+                        width='stretch')
+        if cfg["radius"] > 0:
+            st.plotly_chart(IP.gap_figure(iters, H, "err_in",
+                                          "In-weakspot advantage", sm, win),
+                            width='stretch')
 
 # ─────────────────────────────────────────────────────────────
-# Helper
+# 🔬 ROUND EXPLORER
 # ─────────────────────────────────────────────────────────────
-def _detect(err, X_eval, grid_flat, xx, yy):
-    """Run the chosen detector; return (surface, centre, extraction)."""
-    surf = P.normalize_surface(DETECTION_METHODS[detect_name](X_eval, err, grid_flat))
-    ext = extract_weakspot(surf, xx, yy, threshold_quantile=extract_q)
-    if ext is None:
-        c = grid_flat[int(np.argmax(surf))]
-        return surf, (float(c[0]), float(c[1])), None
-    return surf, ext["center"], ext
-
-
-# ─────────────────────────────────────────────────────────────
-# RUN THE ITERATIVE LOOP
-# ─────────────────────────────────────────────────────────────
-if run_btn:
-    rng = np.random.RandomState(int(seed))
-    center = np.array([center_x, center_y])
-
-    X_all = P.sample_inputs(n_pool_total, rng, shift_strength=shift_strength,
-                            shift_center=(scx, scy), shift_spread=shift_spread)
-    y_all = P.label(X_all, rng, n_bumps=n_bumps, noise_std=noise_std)
-    if induce_ws:
-        X_keep, y_keep, X_excl, y_excl = P.induce_weakspot(X_all, y_all, center, radius)
-        r_eff = float(radius)
+with tabs[2]:
+    if R is None or not R["rounds"]:
+        st.info("Run the pipeline to populate this tab.")
     else:
-        X_keep, y_keep = X_all, y_all
-        r_eff = 0.0
-
-    k = min(int(n_train), len(X_keep))
-    tr_idx = rng.choice(len(X_keep), size=k, replace=False)
-    X_tr0, y_tr0 = X_keep[tr_idx], y_keep[tr_idx]
-
-    X_eval = P.sample_inputs(n_eval, rng, shift_strength=0.0)
-    y_eval = P.true_function(X_eval, n_bumps=n_bumps)
-    xx, yy, grid_flat = create_grid(resolution=int(grid_res))
-    true_grid = P.landscape_surface(grid_flat, n_bumps=n_bumps)
-
-    def _region(err):
-        return (P.region_error(X_eval, err, center, r_eff)[0]
-                if r_eff > 0 else float("nan"))
-
-    # Warm-start (transfer) is implemented for the MLP; other algorithms fall back
-    # to from-scratch each iteration.
-    warm_requested = training_mode.startswith("Warm")
-    warm = warm_requested and AVAILABLE_MODELS[model_name] == "mlp"
-    if warm_requested and not warm:
-        st.info(f"Warm-start is only implemented for the MLP; **{model_name}** "
-                f"retrains from scratch each iteration instead.")
-
-    # initial (shared) model. In warm-start mode it keeps its weights so every track
-    # can *continue* from it (transfer / fine-tuning).
-    m0 = build_model(AVAILABLE_MODELS[model_name], complexity=complexity,
-                     iterations=int(iters_initial), warm_start=warm,
-                     early_stopping=early_stop)
-    m0.fit(X_tr0, y_tr0)
-    _, err0, met0 = P.evaluate(m0, X_eval, y_eval)
-
-    # Two accumulating training sets (guided / random). The guided-accumulative
-    # model (mg) is the one whose weakspot drives the selection each round.
-    Xg, yg = X_tr0.copy(), y_tr0.copy()
-    Xr, yr = X_tr0.copy(), y_tr0.copy()
-
-    # Six tracks: strategy (guided/random) × regime
-    # (accumulative / new-only / scaled-accum). Scaled-accum keeps the accumulative
-    # DISTRIBUTION but subsamples it down to the new-only point BUDGET, so it is a
-    # fair, size-matched control (a fixed-size replay buffer).
-    TRACKS = ("gacc", "racc", "gnew", "rnew", "gsca", "rsca")
-    hist = {k: [met0["MAE"]] for k in TRACKS}
-    ein = {k: [_region(err0)] for k in TRACKS}
-    rounds = []
-
-    # Warm-start: one persistent model per track, each a copy of the shared initial
-    # model, *continued* every iteration (weights carried over) with iters_retrain
-    # epochs added per round — instead of being rebuilt from scratch.
-    track_models = None
-    if warm:
-        track_models = {}
-        for k in TRACKS:
-            mm = copy.deepcopy(m0)
-            mm.named_steps["model"].max_iter = int(iters_retrain)
-            track_models[k] = mm
-    mg = track_models["gacc"] if warm else m0
-
-    def _fit_eval(X, y, track):
-        """Fit and evaluate one track's model on (X, y).
-
-        Warm-start: continue that track's persistent model from its carried-over
-        weights (transfer). From-scratch: build and train a brand-new model.
-        Returns (model, MAE, in-weakspot error).
-        """
-        if warm:
-            m = track_models[track]
-            m.fit(X, y)                 # continues from the previous iteration
-        else:
-            m = build_model(AVAILABLE_MODELS[model_name], complexity=complexity,
-                            iterations=int(iters_retrain), early_stopping=early_stop)
-            m.fit(X, y)
-        _, err, met = P.evaluate(m, X_eval, y_eval)
-        return m, met["MAE"], _region(err)
-
-    prog = st.progress(0.0, text="Iterating…")
-    for it in range(1, int(n_iterations) + 1):
-        # detect the current weakspot on the guided-accumulative model
-        _, errg, _ = P.evaluate(mg, X_eval, y_eval)
-        surf_g, c_g, ext_g = _detect(errg, X_eval, grid_flat, xx, yy)
-
-        # one guided selection and one random selection, shared by both regimes
-        Xc_g = P.sample_inputs(n_candidate, rng, shift_strength=0.0)
-        yc_g = P.label(Xc_g, rng, n_bumps=n_bumps, noise_std=noise_std)
-        idx_g, w_g = P.select_by_weakspot(Xc_g, c_g, sel_sigma, int(n_select), rng,
-                                          sel_mode, method=sel_method,
-                                          ext=ext_g, surf=surf_g)
-        Xsel_g, ysel_g = Xc_g[idx_g], yc_g[idx_g]
-
-        Xc_r = P.sample_inputs(n_candidate, rng, shift_strength=0.0)
-        yc_r = P.label(Xc_r, rng, n_bumps=n_bumps, noise_std=noise_std)
-        idx_r = rng.choice(len(Xc_r), size=min(int(n_select), len(Xc_r)), replace=False)
-        Xsel_r, ysel_r = Xc_r[idx_r], yc_r[idx_r]
-
-        # accumulative: add to the growing sets and (re)train on everything
-        Xg = np.vstack([Xg, Xsel_g]); yg = np.concatenate([yg, ysel_g])
-        Xr = np.vstack([Xr, Xsel_r]); yr = np.concatenate([yr, ysel_r])
-        mg, mae_gacc, ein_gacc = _fit_eval(Xg, yg, "gacc")  # mg feeds next round's detection
-        _,  mae_racc, ein_racc = _fit_eval(Xr, yr, "racc")
-        # new-only: train on just this round's selection (from scratch, or continued
-        # from the carried-over weights in warm-start mode)
-        _,  mae_gnew, ein_gnew = _fit_eval(Xsel_g, ysel_g, "gnew")
-        _,  mae_rnew, ein_rnew = _fit_eval(Xsel_r, ysel_r, "rnew")
-        # scaled-accum: same point BUDGET as new-only (a random subsample of the
-        # full accumulated pool), so it retains coverage but matches the size —
-        # isolating distribution from raw count. Falls back to the whole pool if it
-        # is already smaller than the budget.
-        bud_g = min(len(Xsel_g), len(Xg))
-        sub_g = rng.choice(len(Xg), size=bud_g, replace=False)
-        _,  mae_gsca, ein_gsca = _fit_eval(Xg[sub_g], yg[sub_g], "gsca")
-        bud_r = min(len(Xsel_r), len(Xr))
-        sub_r = rng.choice(len(Xr), size=bud_r, replace=False)
-        _,  mae_rsca, ein_rsca = _fit_eval(Xr[sub_r], yr[sub_r], "rsca")
-
-        hist["gacc"].append(mae_gacc); hist["racc"].append(mae_racc)
-        hist["gnew"].append(mae_gnew); hist["rnew"].append(mae_rnew)
-        hist["gsca"].append(mae_gsca); hist["rsca"].append(mae_rsca)
-        ein["gacc"].append(ein_gacc); ein["racc"].append(ein_racc)
-        ein["gnew"].append(ein_gnew); ein["rnew"].append(ein_rnew)
-        ein["gsca"].append(ein_gsca); ein["rsca"].append(ein_rsca)
-
-        rounds.append(dict(
-            c_g=c_g, Xc_g=Xc_g, w_g=w_g, Xsel_g=Xsel_g, errg=errg, ext_g=ext_g,
-            Xc_r=Xc_r, Xsel_r=Xsel_r, n_train_acc=len(Xg),
-        ))
-        prog.progress(it / int(n_iterations), text=f"Iteration {it}/{n_iterations}")
-    prog.empty()
-
-    st.session_state["iter"] = dict(
-        center=center, radius=r_eff, has_ws=induce_ws, xx=xx, yy=yy,
-        true_grid=true_grid, X_eval=X_eval, hist=hist, ein=ein, rounds=rounds,
-        detect_name=detect_name, n_iterations=int(n_iterations),
-        sel_sigma=sel_sigma, sel_mode=sel_mode, n_select=int(n_select),
-        model_name=model_name, sel_method=sel_method,
-        training_mode=("Warm-start (transfer)" if warm else "From scratch (retrain)"),
-        early_stop=bool(early_stop),
-    )
-
+        su, cfg = R["setup"], R["cfg"]
+        st.subheader("What each round actually selected")
+        st.caption(
+            "Pick a round. **Left:** the guided selection, with the candidate pool "
+            "coloured by the selection weight and the σ rings drawn on the *detected* "
+            "centre. **Right:** the random baseline drawn from the same pool. Both "
+            "selections feed every regime — appended to the accumulative set and, "
+            "separately, used alone by the new-only model. The dashed red circle is "
+            "the induced gap.")
+        it_sel = st.slider("Iteration", 1, len(R["rounds"]), 1, key="it_round_pick")
+        rd = R["rounds"][it_sel - 1]
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("α this round", f"{rd['mix']:.3f}")
+        k2.metric("σ this round", f"{rd['sigma']:.3f}")
+        k3.metric("learning rate", f"{rd['lr']:.2e}")
+        k4.metric("weakspot severity", f"{rd['severity']:.2f}",
+                  help="Mean error inside the detected region ÷ mean error outside, "
+                       "computed from the model's own error distribution. 1.0 means "
+                       "nothing stands out any more.")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(f"**Guided** — *{cfg['sel_method']}* via *{cfg['detector']}*, "
+                        f"{len(rd['Xsel_g'])} points added "
+                        f"(accumulative set now {rd['n_train_acc']})")
+            st.plotly_chart(plot_selection(
+                rd["Xc_g"], rd["w_g"], rd["Xsel_g"], rd["c_g"], rd["sigma"],
+                su["center"], su["radius"],
+                title=f"Iteration {it_sel}: guided selection"),
+                width='stretch', key=f"itg_{it_sel}")
+        with c2:
+            st.markdown(f"**Random baseline** — uniform from the same pool, "
+                        f"{len(rd['Xsel_r'])} points added")
+            st.plotly_chart(plot_selection(
+                rd["Xc_r"], None, rd["Xsel_r"], None, None, su["center"], su["radius"],
+                show_kernel=False, title=f"Iteration {it_sel}: random selection"),
+                width='stretch', key=f"itr_{it_sel}")
+        st.markdown(f"**Model error entering round {it_sel}** — the field the detector "
+                    f"searched for the weakspot:")
+        st.plotly_chart(plot_ground_truth_error(su["X_eval"], rd["err"],
+                                                su["center"], su["radius"]),
+                        width='stretch', key=f"iterr_{it_sel}")
 
 # ─────────────────────────────────────────────────────────────
-# RESULTS
+# 🎛️ SCHEDULES & DETECTION
 # ─────────────────────────────────────────────────────────────
-if "iter" not in st.session_state:
-    st.info("Configure the sidebar and press **🚀 Run Iterative Pipeline**.")
-    st.stop()
+with tabs[3]:
+    if R is None:
+        st.info("Run the pipeline to populate this tab.")
+    else:
+        su = R["setup"]
+        st.subheader("The controls, as actually applied")
+        st.caption(
+            "The paper identified the rehearsal mix α and the kernel width σ as the "
+            "two dominant factors, ahead of the model state and far ahead of anything "
+            "describing the task. In a loop they are no longer constants. This chart "
+            "shows what each round really used, with the learning rate on its own log "
+            "axis and the detected weakspot severity overlaid — the signal an adaptive "
+            "schedule reacts to.")
+        st.plotly_chart(IP.schedule_figure(R["sched"]), width='stretch')
 
-R = st.session_state["iter"]
-center, radius = R["center"], R["radius"]
-iters = list(range(0, R["n_iterations"] + 1))
+        st.markdown("---")
+        st.subheader("Does the loop keep finding the weakspot?")
+        st.caption(
+            "Detection quality per round, and how far the detected centre moved from "
+            "the previous one. As the gap heals the detector should legitimately lose "
+            "it — distance and drift rise, IoU falls — because the weakest region is "
+            "genuinely somewhere else by then. Distinguishing that healthy migration "
+            "from a detector simply failing is what the right-hand trajectory is for.")
+        d1, d2 = st.columns([1.2, 1])
+        d1.plotly_chart(IP.detection_figure(R["det"]), width='stretch')
+        d2.plotly_chart(IP.trajectory_figure(R["det"], su["center"], su["radius"]),
+                        width='stretch')
 
-tab_v, tab_s = st.tabs(["🔬 Visualisation", "🧾 Summary"])
+# ─────────────────────────────────────────────────────────────
+# 🧾 SUMMARY
+# ─────────────────────────────────────────────────────────────
+with tabs[4]:
+    if R is None:
+        st.info("Run the pipeline to populate this tab.")
+    else:
+        H, cfg, iters = R["tracks"], R["cfg"], R["iters"]
+        summ = L.summarise(R)
+        st.subheader("Iteration-by-iteration results")
+        cols = {"iteration": iters}
+        for t in R["active"]:
+            strat, regime = L.TRACKS[t]
+            cols[f"{strat}_{regime}_MAE"] = np.round(H[t]["mae"], 4)
+        if cfg["radius"] > 0:
+            cols["guided_err_in"] = np.round(H["gacc"]["err_in"], 4)
+            cols["random_err_in"] = np.round(H["racc"]["err_in"], 4)
+            cols["guided_err_out"] = np.round(H["gacc"]["err_out"], 4)
+            cols["random_err_out"] = np.round(H["racc"]["err_out"], 4)
+        cols["guided_train_pts"] = H["gacc"]["n_train"]
+        df = pd.DataFrame(cols)
+        st.dataframe(df, width='stretch', hide_index=True)
 
-# Track metadata: key → (strategy, regime, colour)
-_TRACKS = {
-    "gacc": ("guided", "accumulative", "#2ca02c"),
-    "racc": ("random", "accumulative", "#d62728"),
-    "gnew": ("guided", "new-only", "#2ca02c"),
-    "rnew": ("random", "new-only", "#d62728"),
-    "gsca": ("guided", "scaled-accum", "#2ca02c"),
-    "rsca": ("random", "scaled-accum", "#d62728"),
-}
-_CMAP = {"guided": "#2ca02c", "random": "#d62728"}
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Final gap (guided − random)", f"{summ['final_gap_mae']:+.4f}",
+                  help="Whole-area MAE at the last iteration. Negative = guided ahead.")
+        m2.metric("Across-loop mean gap", f"{summ['auc_gap_mae']:+.4f}",
+                  help="Mean of guided − random over iterations 1…K. More honest than "
+                       "the final value when the curves cross.")
+        m3.metric("Iterations guided led", f"{summ['win_rate_iters']*100:.0f}%")
+        m4.metric("Best iteration (guided)", summ["best_iter_guided"],
+                  help="Where guided accumulative reached its lowest MAE. Earlier than "
+                       "K means the loop overshot and should have stopped.")
 
+        verdict = ("**ahead of** the random baseline ✅" if summ["auc_gap_mae"] < 0
+                   else "**behind** the random baseline ⚠️")
+        lines = [
+            f"Across **{cfg['n_iterations']}** iterations, guided selection finished "
+            f"{verdict} on the across-loop average (Δ {summ['auc_gap_mae']:+.4f}), "
+            f"leading in {summ['win_rate_iters']*100:.0f}% of rounds."
+        ]
+        if cfg["radius"] > 0:
+            lines.append(
+                f"- **In-weakspot** — final guided − random = "
+                f"{summ['final_gap_err_in']:+.4f}. This is where guidance is supposed "
+                f"to pay; a local win with a whole-area tie is the honest, defensible "
+                f"claim, and matches what the single-round study reported."
+            )
+            lines.append(
+                f"- **Forgetting** (error *outside* the gap, iteration K − iteration 0) "
+                f"— guided **{summ['forgetting_guided']:+.4f}**, random "
+                f"**{summ['forgetting_random']:+.4f}**. Positive means the model got "
+                f"worse where it was already competent: the collapse the companion "
+                f"paper attributed to over-concentration, now measured directly rather "
+                f"than inferred."
+            )
+        if "gnew" in H and "gsca" in H:
+            gsca, gnew = H["gsca"]["mae"][-1], H["gnew"]["mae"][-1]
+            fair = ("**confirms the distribution matters** ✅" if gsca < gnew
+                    else "does not separate from new-only here ⚠️")
+            lines.append(
+                f"- **Size-matched control** — guided scaled-accum **{gsca:.4f}** vs "
+                f"guided new-only **{gnew:.4f}** ({gsca - gnew:+.4f}) → this {fair}. "
+                f"Both train on the same number of points; only the distribution "
+                f"differs, so a gap here is not explained by the amount of data."
+            )
+        if R.get("single_shot"):
+            ss = R["single_shot"]
+            stg = summ.get("staging_gain_guided", float("nan"))
+            better = "better than" if stg > 0 else "no better than"
+            lines.append(
+                f"- **Staging** — the budget- and compute-matched single-shot guided "
+                f"model reached **{ss['guided']['mae']:.4f}** against the loop's "
+                f"**{H['gacc']['mae'][-1]:.4f}**, so iterating was {better} spending "
+                f"the same budget at once (Δ {stg:+.4f}). The random single-shot "
+                f"reference is **{ss['random']['mae']:.4f}**."
+            )
+        st.markdown("\n".join(lines))
 
-def _long(store):
-    rows = []
-    for k, (strat, regime, _) in _TRACKS.items():
-        for i, v in zip(iters, store[k]):
-            rows.append({"iteration": i, "value": v, "strategy": strat,
-                         "regime": regime, "track": f"{strat} · {regime}"})
-    return pd.DataFrame(rows)
+        st.download_button("⬇ Download iteration history (CSV)",
+                           data=df.to_csv(index=False).encode("utf-8"),
+                           file_name="iterative_history.csv", mime="text/csv")
+        with st.expander("Full configuration for this run"):
+            st.json({k: (list(v) if isinstance(v, list) else v)
+                     for k, v in cfg.items()})
 
-
-# Regime → line style, so a smoothed go.Figure keeps the same visual grammar as
-# the original px.line (colour = strategy, dash = regime).
-_DASH = {"accumulative": "solid", "new-only": "dot", "scaled-accum": "dash"}
-
-
-def _smooth_series(y, method: str, win: int):
-    """Smooth one iteration series. ``min_periods=1`` / ``adjust=False`` keep the
-    endpoints defined, so short curves (few iterations) still plot end to end."""
-    s = pd.Series(np.asarray(y, dtype=float))
-    if method == "Rolling mean":
-        return s.rolling(int(win), center=True, min_periods=1).mean().to_numpy()
-    if method == "Exponential (EWMA)":
-        return s.ewm(span=max(int(win), 1), adjust=False).mean().to_numpy()
-    return s.to_numpy()
-
-
-def _trend_fig(store, ylab: str, title: str, method: str, win: int):
-    """Per-iteration trend chart. When smoothing is on, the bold line is the
-    smoothed trend and the raw points stay visible as faint dots (nothing hidden);
-    when off, it reproduces the original raw line+markers plot."""
-    dfl = _long(store)
-    fig = go.Figure()
-    for (strat, regime), g in dfl.groupby(["strategy", "regime"], sort=False):
-        g = g.sort_values("iteration")
-        color, dash = _CMAP[strat], _DASH.get(regime, "solid")
-        name = f"{strat} · {regime}"
-        if method != "None":
-            fig.add_trace(go.Scatter(
-                x=g["iteration"], y=g["value"], mode="markers",
-                marker=dict(color=color, size=5), opacity=0.25,
-                legendgroup=name, showlegend=False, hoverinfo="skip"))
-            fig.add_trace(go.Scatter(
-                x=g["iteration"], y=_smooth_series(g["value"], method, win),
-                mode="lines", line=dict(color=color, dash=dash, width=2.5),
-                name=name, legendgroup=name))
-        else:
-            fig.add_trace(go.Scatter(
-                x=g["iteration"], y=g["value"], mode="lines+markers",
-                line=dict(color=color, dash=dash, width=2),
-                marker=dict(color=color, size=6), name=name, legendgroup=name))
-    fig.update_layout(height=440, legend_title_text="", title=title,
-                      xaxis_title="iteration", yaxis_title=ylab)
-    return fig
-
-
-# ── VISUALISATION ────────────────────────────────────────────
-with tab_v:
-    # 1) Performance per iteration
-    st.subheader("① Training progress — MAE per iteration")
+# ─────────────────────────────────────────────────────────────
+# 🧪 PARAMETER SWEEP
+# ─────────────────────────────────────────────────────────────
+with tabs[5]:
+    st.subheader("Parameter sweep over the loop")
     st.caption(
-        f"**Training mode: {R.get('training_mode', 'From scratch (retrain)')}** · "
-        f"early stopping: {'on' if R.get('early_stop') else 'off'} — "
-        "warm-start continues each track's model from the previous iteration "
-        "(transfer); from-scratch rebuilds it every round. "
-    )
-    st.caption(
-        "Six tracks: **strategy** (guided = green, random = red) × **regime** "
-        "(line style). **Accumulative** retrains on the whole growing set; "
-        "**new-only** retrains from scratch on just that round's selection; "
-        "**scaled-accum** subsamples the accumulated pool down to the *same point "
-        "count as new-only* — a size-matched control (a fixed replay buffer). If "
-        "scaled-accum tracks accumulative and beats new-only despite equal point "
-        "counts, the advantage is the training **distribution**, not the raw amount "
-        "of data. Iteration 0 is the shared initial model. Lower is better."
-    )
-    sc1, sc2 = st.columns([1.4, 1])
-    smooth_method = sc1.selectbox(
-        "Trend smoothing", ["None", "Rolling mean", "Exponential (EWMA)"], index=1,
-        help="Smooths the bumpy per-iteration curves so the overall trend reads "
-             "clearly. The raw values stay visible as faint dots. Purely visual — "
-             "the Summary table and CSV download always use the raw numbers.")
-    smooth_win = sc2.slider(
-        "Smoothing window / span", 2, max(3, R["n_iterations"]), 3,
-        disabled=(smooth_method == "None"),
-        help="Rolling mean: width of the centred moving-average window. "
-             "EWMA: span (larger = smoother, more lag).")
+        "Runs a whole grid of trajectories and appends **one row per (configuration × "
+        "detector × iteration)** to this config's results CSV, which the "
+        "**Iterative — Visualise Results** page reads. A configuration's rows are "
+        "written together and keyed by how the configuration differs from the paper's "
+        "operating point, so a run resumes exactly where it stopped and adding a new "
+        "axis later never invalidates what is already collected.")
 
-    st.plotly_chart(
-        _trend_fig(R["hist"], "MAE",
-                   "Evaluation MAE vs iteration — accumulative vs new-only vs scaled-accum",
-                   smooth_method, smooth_win),
-        width='stretch')
+    cfg_names = SW.available_configs()
+    cfg_choice = st.selectbox(
+        "Sweep configuration", cfg_names,
+        index=cfg_names.index(SW.SWEEP_CONFIG_NAME) if SW.SWEEP_CONFIG_NAME in cfg_names else 0,
+        help="Grids live in `scripts/iterative/sweep_configs/<name>.json`. Each writes "
+             "to its own `sweep__<name>.csv`. Add a JSON there to define a new study.")
+    if cfg_choice != SW.SWEEP_CONFIG_NAME:
+        SW.set_active_config(cfg_choice)
+    st.info(f"**{SW.SWEEP_CONFIG_NAME}** → `{SW.CSV_PATH}`\n\n"
+            f"{SW.ACTIVE_CONFIG.get('description', '')}")
 
-    if R["has_ws"] and any(v == v for v in R["ein"]["gacc"]):
-        st.plotly_chart(
-            _trend_fig(R["ein"], "error in weakspot",
-                       "Mean error inside the induced weakspot vs iteration",
-                       smooth_method, smooth_win),
-            width='stretch')
-
-    st.markdown("---")
-
-    # 2) Per-iteration data pool & selection
-    st.subheader("② Data pool & selection at each iteration")
-    st.caption("Pick an iteration. Left: the guided selection (candidate pool "
-               "coloured by the Gaussian selection weight around the detected "
-               "weakspot). Right: the random baseline selection from the same-size "
-               "pool. **Each selection is used by both regimes** — added to the "
-               "accumulative set and, separately, used alone for the new-only model. "
-               "The dashed red circle is the induced weakspot.")
-    it_sel = st.slider("Iteration", 1, R["n_iterations"], 1)
-    rd = R["rounds"][it_sel - 1]
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown(f"**Guided** — strategy *{R.get('sel_method', 'Weakpoint distance')}*, "
-                    f"detector *{R['detect_name']}*, "
-                    f"σ={R['sel_sigma']:.2f}, added {R['n_select']} "
-                    f"(accumulative set now {rd['n_train_acc']})")
-        st.plotly_chart(
-            plot_selection(rd["Xc_g"], rd["w_g"], rd["Xsel_g"], rd["c_g"],
-                           R["sel_sigma"], center, radius,
-                           title=f"Iteration {it_sel}: guided selection"),
-            width='stretch', key=f"g_{it_sel}")
-    with c2:
-        st.markdown(f"**Random baseline** — uniform, added {R['n_select']} "
-                    f"(accumulative set now {rd['n_train_acc']})")
-        st.plotly_chart(
-            plot_selection(rd["Xc_r"], None, rd["Xsel_r"], None, None,
-                           center, radius, show_kernel=False,
-                           title=f"Iteration {it_sel}: random selection"),
-            width='stretch', key=f"r_{it_sel}")
-
-    st.markdown(f"**Model error before selection at iteration {it_sel}** "
-                "(where the detector looked for the weakspot):")
-    st.plotly_chart(
-        plot_ground_truth_error(R["X_eval"], rd["errg"], center, radius),
-        width='stretch', key=f"err_{it_sel}")
-
-# ── SUMMARY ──────────────────────────────────────────────────
-with tab_s:
-    st.subheader("Iteration-by-iteration results")
-    H = R["hist"]
-    df = pd.DataFrame({
-        "iteration": iters,
-        "guided_acc_MAE": np.round(H["gacc"], 4),
-        "random_acc_MAE": np.round(H["racc"], 4),
-        "guided_scaled_MAE": np.round(H["gsca"], 4),
-        "random_scaled_MAE": np.round(H["rsca"], 4),
-        "guided_new_MAE": np.round(H["gnew"], 4),
-        "random_new_MAE": np.round(H["rnew"], 4),
-    })
-    if R["has_ws"]:
-        E = R["ein"]
-        df["guided_acc_err_in_ws"] = np.round(E["gacc"], 4)
-        df["random_acc_err_in_ws"] = np.round(E["racc"], 4)
-    st.dataframe(df, width='stretch', hide_index=True)
-
-    gacc, racc = H["gacc"][-1], H["racc"][-1]
-    gnew, rnew = H["gnew"][-1], H["rnew"][-1]
-    gsca, rsca = H["gsca"][-1], H["rsca"][-1]
-    v_acc = "**below** random ✅" if gacc < racc else "**above** random ⚠️"
-    fair = ("**confirms distribution matters** ✅" if gsca < gnew else
-            "does not separate from new-only here ⚠️")
+    total_runs = prod(len(v) for v in SW.SWEEP_GRID.values())
+    est_min = total_runs * SW.SECS_PER_RUN / 60
+    swept = ", ".join(f"`{k}`×{len(v)}" for k, v in SW.SWEEP_GRID.items() if len(v) > 1)
     st.markdown(
-        f"After **{R['n_iterations']}** iterations:\n\n"
-        f"- **Accumulative** — guided **{gacc:.4f}** vs random **{racc:.4f}** "
-        f"(guided finished {v_acc}, Δ {gacc - racc:+.4f}).\n"
-        f"- **New-only** — guided **{gnew:.4f}** vs random **{rnew:.4f}**. "
-        f"Retraining on only each round's points typically stays far worse than the "
-        f"accumulative regime — the iterative sign of catastrophic forgetting.\n"
-        f"- **Scaled-accum (size-matched control)** — guided **{gsca:.4f}** vs random "
-        f"**{rsca:.4f}**. Same point count as new-only, but sampled to keep coverage: "
-        f"guided scaled-accum vs guided new-only = {gsca - gnew:+.4f} → this {fair} "
-        f"(if scaled-accum beats new-only at equal size, the win is the training "
-        f"distribution, not the number of points)."
+        f"**Swept axes:** {swept or '— (single configuration)'}  \n"
+        f"**Detectors:** {len(SW.SWEEP_DETECTORS)} "
+        f"({', '.join(SW.SWEEP_DETECTORS)}) — each runs its own trajectory, since "
+        f"detectors steer different selections and diverge after iteration 0.  \n"
+        f"**Held at the sidebar values:** model=`{model_name}`, complexity="
+        f"`{complexity}`, weakspot centre=({center_x}, {center_y}), n_eval=`{n_eval}`, "
+        f"grid_res=`{grid_res}`, extract_q=`{extract_q}`, selection rule=`{sel_mode}`, "
+        f"early stopping=`{early_stop}`, single-shot control=`{single_shot}`.")
+
+    q1, q2, q3 = st.columns(3)
+    q1.metric("Configurations", f"{total_runs:,}")
+    q2.metric("Est. full sweep", f"{est_min:,.0f} min")
+    q3.metric("Rows per config",
+              f"~{len(SW.SWEEP_DETECTORS) * (int(n_iterations) + 1):,}")
+
+    resume = st.checkbox(
+        "Skip already-completed configurations (resume)", value=True,
+        help="Scans the results CSV **only when the sweep is launched**, never on page "
+             "render, so opening this tab stays fast even for large result files.")
+    max_workers = os.cpu_count() or 4
+    run_parallel = st.checkbox(
+        "⚡ Run in parallel (multiple CPU cores)", value=False,
+        help="Distributes configurations across cores with joblib. Workers only "
+             "compute; the main process does every CSV write, so resume integrity is "
+             "unaffected.")
+    n_workers = st.slider("Worker processes", 1, max_workers, max(1, max_workers // 2),
+                          disabled=not run_parallel) if run_parallel else 1
+    if run_parallel and n_workers > 1:
+        st.caption(f"With **{n_workers} workers** the ≈{est_min:,.0f} min estimate "
+                   f"should fall to roughly **{est_min / n_workers:,.0f} min**.")
+    go_sweep = st.button("▶ Run Sweep", type="primary", width='stretch',
+                         disabled=total_runs == 0)
+
+    fixed_params = dict(
+        model_name=model_name, complexity=float(complexity),
+        center_x=float(center_x), center_y=float(center_y), n_eval=int(n_eval),
+        grid_res=int(grid_res), extract_q=float(extract_q), sel_mode=sel_mode,
+        shift_center_x=float(scx), shift_center_y=float(scy),
+        shift_spread=float(shift_spread), early_stopping=bool(early_stop),
+        single_shot=bool(single_shot), tie_model_seed=bool(tie_model_seed),
     )
-    st.download_button("⬇ Download iteration history (CSV)",
-                       data=df.to_csv(index=False).encode("utf-8"),
-                       file_name="iterative_history.csv", mime="text/csv")
+
+    if go_sweep:
+        with st.spinner("Checking which configurations are already done…"):
+            if resume:
+                remaining = SW.remaining_combos(fixed_params)
+            else:
+                remaining = [{**c, **fixed_params} for c in SW.parameter_grid()]
+        if not remaining:
+            st.success(f"✓ All {total_runs:,} configurations are already in "
+                       f"`{SW.CSV_PATH.name}` — nothing to run. Uncheck **resume** to "
+                       f"recompute them.")
+        else:
+            n_total = len(remaining)
+            bar = st.progress(0.0, text=f"0 / {n_total} — starting…")
+            t0 = time.time()
+
+            def _tick(done, elapsed):
+                eta = (elapsed / max(done, 1)) * (n_total - done) / 60
+                bar.progress(done / n_total,
+                             text=f"{done}/{n_total} · "
+                                  f"{'⚡ ' + str(n_workers) + ' workers' if run_parallel else 'sequential'}"
+                                  f" · elapsed {elapsed:.0f}s · ETA {eta:.1f} min")
+
+            if run_parallel and n_workers > 1:
+                from joblib import Parallel, delayed, parallel_backend
+                i, w, done = 0, n_workers, 0
+                while i < n_total:
+                    batch = max(w * 2, 1)
+                    try:
+                        with parallel_backend("loky", inner_max_num_threads=1):
+                            with Parallel(n_jobs=w) as par:
+                                while i < n_total:
+                                    chunk = remaining[i:i + batch]
+                                    for rows in par(delayed(SW.safe_run_one)(p)
+                                                    for p in chunk):
+                                        SW.append_rows(SW.CSV_PATH, rows)
+                                    i += len(chunk); done += len(chunk)
+                                    _tick(done, time.time() - t0)
+                        break
+                    except Exception as e:
+                        new_w = max(1, w // 2)
+                        st.warning(
+                            f"Parallel workers were terminated ({type(e).__name__}, "
+                            f"usually out-of-memory). Reducing workers **{w} → "
+                            f"{new_w}** and continuing — completed configurations are "
+                            f"saved and resumable.")
+                        w = new_w
+                        if w == 1:
+                            for params in remaining[i:]:
+                                SW.append_rows(SW.CSV_PATH, SW.safe_run_one(params))
+                                i += 1; done += 1
+                                _tick(done, time.time() - t0)
+                            break
+            else:
+                for i, params in enumerate(remaining):
+                    try:
+                        SW.append_rows(SW.CSV_PATH, SW.run_one(params))
+                    except Exception as e:
+                        st.warning(f"Configuration {i + 1} failed: {e}")
+                    _tick(i + 1, time.time() - t0)
+
+            bar.empty()
+            st.success(
+                f"Sweep complete in {(time.time() - t0) / 60:.1f} min. Rows appended to "
+                f"`{SW.CSV_PATH}`. Open **Iterative — Visualise Results** to explore.")

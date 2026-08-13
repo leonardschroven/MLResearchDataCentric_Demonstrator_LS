@@ -1,0 +1,34 @@
+{
+  "name": "iter_baseline",
+  "description": "The reference trajectory: the companion paper's operating point (n_bumps 5, noise 0.05, radius 0.25, iters_initial 12, n_train 100, sel_sigma 0.5, mix_ratio 0.5, n_select 100, iters_retrain 400, warm-start) run as a LOOP instead of a single round, over 8 iterations, all three regimes and 10 seeds. Answers the first question the single-round study could not: does the guided advantage survive repetition, and does accumulating the training set remove the catastrophic-forgetting collapse the paper measured under its new-points-only protocol? n_iterations is swept so the trajectory length itself is an axis. Detector trio = the strongest and most diverse at this anchor.",
+  "secs_per_run": 15.0,
+  "detectors": [
+    "Quantile Regression",
+    "Peaks over Threshold (EVT)",
+    "RBF Interpolation"
+  ],
+  "grid": {
+    "n_iterations": [
+      8
+    ],
+    "regimes": [
+      [
+        "accumulative",
+        "new-only",
+        "scaled-accum"
+      ]
+    ],
+    "seed": [
+      42,
+      0,
+      7,
+      1,
+      3,
+      5,
+      11,
+      17,
+      23,
+      99
+    ]
+  }
+}
